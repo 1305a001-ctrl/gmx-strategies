@@ -1,0 +1,15 @@
+services:
+  gmx-strategies:
+    image: ghcr.io/1305a001-ctrl/gmx-strategies:latest
+    container_name: gmx-strategies
+    restart: unless-stopped
+    env_file:
+      - /srv/secrets/gmx-strategies.env
+    ports:
+      - "127.0.0.1:8013:8013"
+    networks:
+      - infra-net
+
+networks:
+  infra-net:
+    external: true
