@@ -11,12 +11,13 @@ version = "0.1.0"
 description = "GMX V2 strategies — liquidation triggering (Data Streams edge), funding rate arb, Keeper bot."
 requires-python = ">=3.11"
 dependencies = [
-    "redis[hiredis]>=5.0",
-    "structlog>=24.1",
-    "pydantic-settings>=2.3",
-    "aiohttp>=3.9",
-    "httpx>=0.27",
-    "web3>=6.20",
+    # Pinned to specific versions to mitigate supply-chain risk.
+    "redis[hiredis]==7.4.0",
+    "structlog==25.5.0",
+    "pydantic-settings==2.13.0",
+    "aiohttp==3.13.5",
+    "httpx==0.28.1",
+    "web3==7.16.0",
 ]
 
 [project.scripts]
@@ -24,10 +25,10 @@ gmx-strategies = "gmx_strategies.main:main"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23",
-    "ruff>=0.4",
-    "mypy>=1.11",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.15.12",
+    "mypy==2.0.0",
 ]
 
 [tool.ruff]
