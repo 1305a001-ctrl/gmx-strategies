@@ -1,21 +1,20 @@
 """Entrypoint — GMX strategies loop.
 
-v0.1 SCAFFOLD. The pure detection logic is wired and tested
-(liquidation_trigger + funding_arb), but the GMX V2 SDK integration
-is NOT (TODO week 2+):
-  - GMX V2 SDK (TypeScript-first; Python wrapper TBD)
-  - Position discovery via Goldsky GMX subgraph
-  - Funding rate / OI snapshot from GMX V2 reader contract
-  - Keeper bot integration for order execution
+v0.2 SCAFFOLD. Wires the GMX V2 subgraph adapter + chainlink price
+join + paper-mode liquidation watcher. Order routing remains TODO
+(week 2+).
 """
 from __future__ import annotations
 
 import asyncio
 import signal
 
+import httpx
 import structlog
 
+from gmx_strategies.liquidation_watcher import run_watch_cycle
 from gmx_strategies.redis_client import close as close_redis
+from gmx_strategies.redis_client import r
 from gmx_strategies.settings import settings
 
 structlog.configure(
@@ -27,6 +26,59 @@ structlog.configure(
 )
 
 log = structlog.get_logger(__name__)
+
+
+async def _watcher_loop(stop: asyncio.Event) -> None:
+    """Forever loop polling subgraph + emitting eval-log triggers."""
+    if not settings.gmx_subgraph_url:
+        log.warning("gmx_strategies.subgraph_url_empty — watcher idle until configured")
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=settings.gmx_subgraph_poll_interval_sec,
+                )
+            except TimeoutError:
+                pass
+        return
+
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        redis_client = r()
+        log.info(
+            "gmx_strategies.watcher_starting interval=%ds page_size=%d max_pages=%d",
+            settings.gmx_subgraph_poll_interval_sec,
+            settings.gmx_subgraph_page_size,
+            settings.gmx_subgraph_max_pages,
+        )
+        while not stop.is_set():
+            try:
+                stats = await run_watch_cycle(
+                    httpx_client=http,
+                    redis_client=redis_client,
+                    subgraph_url=settings.gmx_subgraph_url,
+                    eval_log_stream=settings.paper_log_stream,
+                    eval_log_maxlen=settings.paper_log_maxlen,
+                    watch_margin=settings.liquidation_watch_margin,
+                    estimated_fee_usd=settings.estimated_keeper_fee_usd,
+                    chainlink_key_template=settings.chainlink_redis_key_template,
+                    page_size=settings.gmx_subgraph_page_size,
+                    max_pages=settings.gmx_subgraph_max_pages,
+                )
+                log.info(
+                    "gmx_strategies.cycle fetched=%d parsed=%d no_price=%d "
+                    "no_alias=%d triggers=%d",
+                    stats.fetched, stats.parsed, stats.no_price,
+                    stats.no_alias, stats.triggers,
+                )
+            except Exception:
+                log.exception("gmx_strategies.cycle_failed")
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=settings.gmx_subgraph_poll_interval_sec,
+                )
+            except TimeoutError:
+                pass
 
 
 async def main_async() -> int:
@@ -43,12 +95,7 @@ async def main_async() -> int:
         loop.add_signal_handler(sig, stop.set)
 
     try:
-        while not stop.is_set():
-            log.info("gmx_strategies.tick gmx_sdk_not_wired_yet")
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=60.0)
-            except TimeoutError:
-                pass
+        await _watcher_loop(stop)
     finally:
         await close_redis()
         log.info("gmx_strategies.stopped")

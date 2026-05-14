@@ -41,6 +41,19 @@ class Settings(BaseSettings):
     paper_log_stream: str = "gmx:eval_log"
     paper_log_maxlen: int = 5_000_000
 
+    # --- Subgraph adapter (paper liquidation discovery) ---
+    # Full Goldsky GMX V2 synthetics-Arbitrum URL. Leave empty until
+    # Ben pastes the real URL; the loop will no-op safely until then.
+    gmx_subgraph_url: str = ""
+    # How often to poll the subgraph for new positions.
+    gmx_subgraph_poll_interval_sec: int = 30
+    # Pagination
+    gmx_subgraph_page_size: int = 200
+    gmx_subgraph_max_pages: int = 10
+    # Chainlink Redis key prefix (used to enrich raw rows with entry price).
+    # Matches the topology in chainlink-streams.
+    chainlink_redis_key_template: str = "chainlink:{alias}:latest"
+
     # --- Live execution gates ---
     live_enabled: bool = False
     live_strategies_confirmed: str = ""    # CSV: liquidation,funding_arb,keeper

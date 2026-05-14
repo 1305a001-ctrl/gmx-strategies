@@ -1,0 +1,192 @@
+"""GMX liquidation watcher — paper-mode glue.
+
+One cycle (default 30s):
+  1. POST GraphQL to GMX V2 subgraph → list[RawSubgraphPosition]
+  2. For each, look up chainlink:<alias>:latest (current oracle price)
+  3. Enrich raw → GMXPosition (skip rows with no alias / no price)
+  4. detect_trigger(pos, current_price, watch_margin, fee) → trigger | None
+  5. XADD `gmx:eval_log` per trigger (paper mode — no order routed)
+
+The keeper / order-execution path is intentionally NOT wired here. That
+comes in week 2 once paper mode shows we're catching ≥60% of profitable
+liquidations.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any
+
+from gmx_strategies.gmx_subgraph import (
+    MARKET_ADDRESS_TO_ALIAS,
+    fetch_open_positions,
+    raw_to_gmx_position,
+)
+from gmx_strategies.liquidation_trigger import detect_trigger
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CycleStats:
+    fetched: int
+    parsed: int
+    no_price: int
+    no_alias: int
+    triggers: int
+
+
+def _parse_chainlink_payload(raw: str | None) -> float | None:
+    """Pure: chainlink:<alias>:latest payload → mid price.
+
+    The chainlink-streams writer publishes {"price": "<decimal>", ...}
+    as JSON. Defensive on parse failure.
+    """
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    p = d.get("price") or d.get("mid") or d.get("benchmark_price")
+    if p is None:
+        return None
+    try:
+        v = float(p)
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
+
+
+def build_eval_log_entry(
+    *,
+    trigger: Any,
+    pos: Any,
+    current_price: float,
+    cycle_unix: int,
+) -> dict[str, str]:
+    """Pure: build a XADD field dict for the gmx:eval_log stream.
+
+    All values stringified — Redis streams want str fields. JSON-encode
+    nested objects so a downstream consumer can decode cleanly.
+    """
+    return {
+        "ts_unix": str(cycle_unix),
+        "user": trigger.user,
+        "market": trigger.market,
+        "is_long": "1" if pos.is_long else "0",
+        "size_usd": f"{pos.size_usd:.4f}",
+        "collateral_usd": f"{pos.collateral_usd:.4f}",
+        "leverage": f"{pos.leverage:.4f}",
+        "entry_price": f"{pos.entry_price:.6f}",
+        "current_price": f"{current_price:.6f}",
+        "distance_to_liq_pct": f"{trigger.distance_to_liq_pct:.4f}",
+        "estimated_fee_usd": f"{trigger.estimated_fee_usd:.4f}",
+        "confidence": f"{trigger.confidence:.4f}",
+        "reason": trigger.reason,
+    }
+
+
+async def run_watch_cycle(
+    *,
+    httpx_client: Any,
+    redis_client: Any,
+    subgraph_url: str,
+    eval_log_stream: str,
+    eval_log_maxlen: int,
+    watch_margin: float,
+    estimated_fee_usd: float,
+    chainlink_key_template: str = "chainlink:{alias}:latest",
+    page_size: int = 200,
+    max_pages: int = 10,
+    alias_map: dict[str, str] | None = None,
+) -> CycleStats:
+    """One iteration. Returns stats for logging."""
+    raws = await fetch_open_positions(
+        httpx_client, subgraph_url,
+        page_size=page_size, max_pages=max_pages,
+    )
+    if not raws:
+        return CycleStats(fetched=0, parsed=0, no_price=0, no_alias=0, triggers=0)
+
+    cycle_unix = int(time.time())
+    no_price = 0
+    no_alias = 0
+    triggers = 0
+    amap = alias_map or MARKET_ADDRESS_TO_ALIAS
+
+    # Cache chainlink prices by alias so we hit Redis O(unique-markets), not
+    # O(positions).
+    price_cache: dict[str, float | None] = {}
+
+    for raw in raws:
+        alias = amap.get(raw.market_address)
+        if alias is None:
+            no_alias += 1
+            continue
+        if alias not in price_cache:
+            try:
+                payload = await redis_client.get(
+                    chainlink_key_template.format(alias=alias),
+                )
+            except Exception:
+                payload = None
+            price_cache[alias] = _parse_chainlink_payload(payload)
+        price = price_cache[alias]
+        if price is None:
+            no_price += 1
+            continue
+
+        # Prefer the subgraph's entryPrice if available; fall back to the
+        # current oracle price (degenerate health calc — won't trigger
+        # unless the position is already structurally under-margined).
+        effective_entry = raw.entry_price if raw.entry_price else price
+        pos = raw_to_gmx_position(
+            raw, entry_price=effective_entry, alias_map=amap,
+        )
+        if pos is None:
+            no_alias += 1   # alias map missed somehow — bucket with no_alias
+            continue
+
+        trigger = detect_trigger(
+            pos, current_price=price,
+            watch_margin=watch_margin,
+            estimated_fee_usd=estimated_fee_usd,
+        )
+        if trigger is None or trigger.reason != "trigger":
+            continue
+
+        # Paper-log only — no order routing in v0.2.
+        try:
+            await redis_client.xadd(
+                eval_log_stream,
+                build_eval_log_entry(
+                    trigger=trigger, pos=pos,
+                    current_price=price, cycle_unix=cycle_unix,
+                ),
+                maxlen=eval_log_maxlen,
+                approximate=True,
+            )
+            triggers += 1
+        except Exception:
+            log.exception("liq_watcher.xadd_failed user=%s market=%s",
+                          trigger.user, trigger.market)
+
+    return CycleStats(
+        fetched=len(raws),
+        parsed=len(raws) - no_alias - no_price,
+        no_price=no_price,
+        no_alias=no_alias,
+        triggers=triggers,
+    )
+
+
+__all__ = [
+    "CycleStats",
+    "build_eval_log_entry",
+    "run_watch_cycle",
+]
