@@ -116,6 +116,14 @@ def parse_raw_subgraph_position(row: dict[str, Any]) -> RawSubgraphPosition | No
         # Some subgraphs expose collateralAmountUsd; some only have the
         # token-amount + a token-price field. Caller can enrich later.
         col_usd = _to_float(row.get("collateralAmountUsd"), scale=1e-30)
+    if col_usd is None:
+        # Subsquid endpoint exposes collateralAmount in TOKEN-native precision
+        # (e.g., USDC at 6 decimals). For a quick fallback approximation:
+        # assume collateral is in USDC (USDC = $1) and divide by 1e6.
+        # This is a rough proxy; on-chain re-check is authoritative.
+        col_amt = _to_float(row.get("collateralAmount"), scale=1e-6)
+        if col_amt is not None and col_amt > 0:
+            col_usd = col_amt
     if col_usd is None or col_usd <= 0:
         return None
 
@@ -193,7 +201,34 @@ def raw_to_gmx_position(
 # ─── GraphQL query ─────────────────────────────────────────────────
 
 
-POSITIONS_QUERY = """
+# GraphQL query in Subsquid dialect (used by the public
+# https://gmx.squids.live/gmx-synthetics-arbitrum:prod/api/graphql endpoint):
+#   - `limit` not `first`
+#   - enum suffix `_DESC` not `orderDirection: desc`
+#   - `where: { sizeInUsd_gt: "0" }` works same as Graph (numeric string)
+#
+# If you point at a Graph hosted-service / Goldsky endpoint instead, the
+# alternative query (POSITIONS_QUERY_GRAPH) is provided. fetch_open_positions
+# auto-detects by URL host and picks the right one.
+POSITIONS_QUERY_SUBSQUID = """
+query OpenPositions($limit: Int!, $skip: Int!) {
+  positions(
+    limit: $limit,
+    offset: $skip,
+    where: { sizeInUsd_gt: "0" },
+    orderBy: sizeInUsd_DESC
+  ) {
+    id
+    account
+    market
+    isLong
+    sizeInUsd
+    collateralAmount
+  }
+}
+""".strip()
+
+POSITIONS_QUERY_GRAPH = """
 query OpenPositions($first: Int!, $skip: Int!) {
   positions(
     first: $first,
@@ -213,6 +248,21 @@ query OpenPositions($first: Int!, $skip: Int!) {
   }
 }
 """.strip()
+
+# Back-compat alias for existing tests that reference POSITIONS_QUERY
+POSITIONS_QUERY = POSITIONS_QUERY_GRAPH
+
+
+def _query_for_url(url: str) -> tuple[str, dict[str, int]]:
+    """Pure: return (query, variables_template_keys) for a given endpoint host.
+
+    Subsquid endpoints use `limit/offset` + `_DESC` enums; Graph/Goldsky use
+    `first/skip` + `orderDirection`.
+    """
+    host = (url or "").lower()
+    if "squids.live" in host or "subsquid" in host or "satsuma" in host:
+        return (POSITIONS_QUERY_SUBSQUID, {"limit_key": "limit", "skip_key": "skip"})
+    return (POSITIONS_QUERY_GRAPH, {"limit_key": "first", "skip_key": "skip"})
 
 
 # ─── Async fetcher ─────────────────────────────────────────────────
@@ -254,6 +304,8 @@ async def fetch_open_positions(
         )
         return []
     import asyncio
+
+    query, var_keys = _query_for_url(subgraph_url)
     out: list[RawSubgraphPosition] = []
     for page in range(max_pages):
         skip = page * page_size
@@ -262,8 +314,11 @@ async def fetch_open_positions(
                 httpx_client.post(
                     subgraph_url,
                     json={
-                        "query": POSITIONS_QUERY,
-                        "variables": {"first": page_size, "skip": skip},
+                        "query": query,
+                        "variables": {
+                            var_keys["limit_key"]: page_size,
+                            var_keys["skip_key"]: skip,
+                        },
                     },
                 ),
                 timeout=timeout_sec,
