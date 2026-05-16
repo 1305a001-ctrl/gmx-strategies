@@ -39,6 +39,7 @@ class CycleStats:
     triggers: int
     executions_paper: int = 0   # plans that passed should_execute + were XADDed
     executions_rejected: int = 0   # plans rejected by the gate (logged reason only)
+    executions_cooldown: int = 0   # plans skipped because a recent fire is on cooldown
 
 
 def _parse_chainlink_payload(raw: str | None) -> float | None:
@@ -114,6 +115,8 @@ async def run_watch_cycle(
     execution_paper_log_maxlen: int = 1_000_000,
     execution_min_net_profit_usd: float = 50.0,
     execution_min_confidence: float = 0.5,
+    execution_cooldown_sec: int = 0,   # 0 disables cooldown (preserves existing contract)
+    execution_cooldown_key_template: str = "gmx:execution:cooldown:{user}:{market}",
 ) -> CycleStats:
     """One iteration. Returns stats for logging."""
     raws = await fetch_open_positions(
@@ -129,6 +132,7 @@ async def run_watch_cycle(
     triggers = 0
     executions_paper = 0
     executions_rejected = 0
+    executions_cooldown = 0
     amap = alias_map or MARKET_ADDRESS_TO_ALIAS
 
     # Cache chainlink prices by alias so we hit Redis O(unique-markets), not
@@ -192,6 +196,23 @@ async def run_watch_cycle(
         # profit/confidence gate? Only writes when explicitly enabled by
         # the caller so the existing eval-log-only contract is preserved.
         if execution_paper_enabled:
+            # Cooldown gate — without this, the same eligible whale is
+            # XADDed every cycle (default 30s) until they actually get
+            # liquidated. Real-world a keeper fires once; we model that
+            # by suppressing same (user, market) inside the cooldown
+            # window. cooldown_sec=0 disables (matches test contract).
+            if execution_cooldown_sec > 0:
+                cooldown_key = execution_cooldown_key_template.format(
+                    user=trigger.user, market=trigger.market,
+                )
+                try:
+                    on_cooldown = await redis_client.get(cooldown_key)
+                except Exception:
+                    on_cooldown = None
+                if on_cooldown:
+                    executions_cooldown += 1
+                    continue
+
             plan = build_plan(
                 trigger=trigger,
                 size_usd=pos.size_usd,
@@ -212,6 +233,19 @@ async def run_watch_cycle(
                         log_stream_maxlen=execution_paper_log_maxlen,
                     )
                     executions_paper += 1
+                    # Set the cooldown after a successful paper-fire.
+                    if execution_cooldown_sec > 0:
+                        try:
+                            await redis_client.set(
+                                cooldown_key,
+                                str(cycle_unix),
+                                ex=execution_cooldown_sec,
+                            )
+                        except Exception:
+                            log.exception(
+                                "liq_watcher.cooldown_set_failed user=%s market=%s",
+                                trigger.user, trigger.market,
+                            )
                 except Exception:
                     log.exception(
                         "liq_watcher.execute_paper_failed user=%s market=%s",
@@ -232,6 +266,7 @@ async def run_watch_cycle(
         triggers=triggers,
         executions_paper=executions_paper,
         executions_rejected=executions_rejected,
+        executions_cooldown=executions_cooldown,
     )
 
 
