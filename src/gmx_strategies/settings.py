@@ -41,6 +41,19 @@ class Settings(BaseSettings):
     paper_log_stream: str = "gmx:eval_log"
     paper_log_maxlen: int = 5_000_000
 
+    # --- Paper execution (would-have-fired) ---
+    # When True, the watcher additionally runs each trigger through
+    # build_plan + should_execute, and writes accepted plans to
+    # `execution_paper_log_stream`. This is the observable feed used
+    # to measure "did the strategy convert" — the eval log only tells
+    # us "we saw a candidate".
+    execution_paper_enabled: bool = True
+    execution_paper_log_stream: str = "gmx:execution:paper_log"
+    execution_paper_log_maxlen: int = 1_000_000
+    # Reject plans below these thresholds (USD net profit, 0-1 confidence).
+    execution_min_net_profit_usd: float = 50.0
+    execution_min_confidence: float = 0.5
+
     # --- Subgraph adapter (paper liquidation discovery) ---
     # Full Goldsky GMX V2 synthetics-Arbitrum URL. Leave empty until
     # Ben pastes the real URL; the loop will no-op safely until then.
