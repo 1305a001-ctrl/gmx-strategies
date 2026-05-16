@@ -259,6 +259,86 @@ async def test_run_watch_cycle_empty_subgraph() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_watch_cycle_paper_execution_disabled_by_default() -> None:
+    """Without execution_paper_enabled, only eval-log XADDs happen — no
+    `gmx:execution:paper_log` writes. Preserves the original v0.2 contract."""
+    pages = [[_gql_row(pid="p1")]]
+    http = _FakeHttpx(pages)
+    redis = _FakeRedis(prices={"btc": {"price": "70000.0"}})
+
+    stats = await run_watch_cycle(
+        httpx_client=http, redis_client=redis,
+        subgraph_url="https://example.com",
+        eval_log_stream="gmx:eval_log", eval_log_maxlen=1000,
+        watch_margin=1.05, estimated_fee_usd=100.0,
+    )
+    assert stats.triggers == 1
+    assert stats.executions_paper == 0
+    assert stats.executions_rejected == 0
+    # Only the eval-log XADD — no execution stream write.
+    streams = [s for s, _ in redis.xadds]
+    assert streams == ["gmx:eval_log"]
+
+
+@pytest.mark.asyncio
+async def test_run_watch_cycle_paper_execution_fires_when_enabled() -> None:
+    """With execution_paper_enabled, a passing trigger writes BOTH the
+    eval-log AND `gmx:execution:paper_log`. Size $5k → fee $25 net $23.5
+    fails default $50 gate, so we pass a generous size to clear it."""
+    # $20k size → fee $100 → net $98.5 (above $50 gate)
+    pages = [[_gql_row(pid="p1", size=20_000.0, col=2000.0)]]
+    http = _FakeHttpx(pages)
+    redis = _FakeRedis(prices={"btc": {"price": "70000.0"}})
+
+    stats = await run_watch_cycle(
+        httpx_client=http, redis_client=redis,
+        subgraph_url="https://example.com",
+        eval_log_stream="gmx:eval_log", eval_log_maxlen=1000,
+        watch_margin=1.05, estimated_fee_usd=100.0,
+        execution_paper_enabled=True,
+        execution_paper_log_stream="gmx:execution:paper_log",
+        execution_min_net_profit_usd=50.0,
+        execution_min_confidence=0.5,
+    )
+    assert stats.triggers == 1
+    assert stats.executions_paper == 1
+    assert stats.executions_rejected == 0
+    streams = [s for s, _ in redis.xadds]
+    assert "gmx:eval_log" in streams
+    assert "gmx:execution:paper_log" in streams
+    # Execution record has the expected shape
+    exec_fields = next(f for s, f in redis.xadds if s == "gmx:execution:paper_log")
+    assert exec_fields["mode"] == "paper"
+    assert exec_fields["market"] == "btc"
+    assert float(exec_fields["expected_net_pnl_usd"]) > 50.0
+
+
+@pytest.mark.asyncio
+async def test_run_watch_cycle_paper_execution_rejected_by_gate() -> None:
+    """Trigger fires (eval-logged) but is below the net-profit gate →
+    execution_paper stream is NOT written; rejected counter increments."""
+    # Tiny size → fee well below the $50 gate
+    pages = [[_gql_row(pid="p1", size=1_000.0, col=100.0)]]
+    http = _FakeHttpx(pages)
+    redis = _FakeRedis(prices={"btc": {"price": "70000.0"}})
+
+    stats = await run_watch_cycle(
+        httpx_client=http, redis_client=redis,
+        subgraph_url="https://example.com",
+        eval_log_stream="gmx:eval_log", eval_log_maxlen=1000,
+        watch_margin=1.05, estimated_fee_usd=100.0,
+        execution_paper_enabled=True,
+        execution_min_net_profit_usd=50.0,
+        execution_min_confidence=0.5,
+    )
+    assert stats.triggers == 1
+    assert stats.executions_paper == 0
+    assert stats.executions_rejected == 1
+    streams = [s for s, _ in redis.xadds]
+    assert streams == ["gmx:eval_log"]
+
+
+@pytest.mark.asyncio
 async def test_run_watch_cycle_caches_prices_per_alias() -> None:
     """Multiple positions on the same market should hit Redis once per alias."""
     pages = [[

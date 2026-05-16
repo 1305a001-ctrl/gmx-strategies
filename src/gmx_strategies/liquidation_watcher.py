@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from gmx_strategies.execution import build_plan, execute_paper, should_execute
 from gmx_strategies.gmx_subgraph import (
     MARKET_ADDRESS_TO_ALIAS,
     fetch_open_positions,
@@ -36,6 +37,8 @@ class CycleStats:
     no_price: int
     no_alias: int
     triggers: int
+    executions_paper: int = 0   # plans that passed should_execute + were XADDed
+    executions_rejected: int = 0   # plans rejected by the gate (logged reason only)
 
 
 def _parse_chainlink_payload(raw: str | None) -> float | None:
@@ -104,6 +107,13 @@ async def run_watch_cycle(
     page_size: int = 200,
     max_pages: int = 10,
     alias_map: dict[str, str] | None = None,
+    # Paper-execution wiring (off by default to preserve the original
+    # "eval-log only" behaviour for existing callers + tests).
+    execution_paper_enabled: bool = False,
+    execution_paper_log_stream: str = "gmx:execution:paper_log",
+    execution_paper_log_maxlen: int = 1_000_000,
+    execution_min_net_profit_usd: float = 50.0,
+    execution_min_confidence: float = 0.5,
 ) -> CycleStats:
     """One iteration. Returns stats for logging."""
     raws = await fetch_open_positions(
@@ -117,6 +127,8 @@ async def run_watch_cycle(
     no_price = 0
     no_alias = 0
     triggers = 0
+    executions_paper = 0
+    executions_rejected = 0
     amap = alias_map or MARKET_ADDRESS_TO_ALIAS
 
     # Cache chainlink prices by alias so we hit Redis O(unique-markets), not
@@ -160,7 +172,7 @@ async def run_watch_cycle(
         if trigger is None or trigger.reason != "trigger":
             continue
 
-        # Paper-log only — no order routing in v0.2.
+        # Eval-log every trigger (the "we saw a candidate" feed).
         try:
             await redis_client.xadd(
                 eval_log_stream,
@@ -176,12 +188,50 @@ async def run_watch_cycle(
             log.exception("liq_watcher.xadd_failed user=%s market=%s",
                           trigger.user, trigger.market)
 
+        # Paper-execution feed: did this candidate actually pass the
+        # profit/confidence gate? Only writes when explicitly enabled by
+        # the caller so the existing eval-log-only contract is preserved.
+        if execution_paper_enabled:
+            plan = build_plan(
+                trigger=trigger,
+                size_usd=pos.size_usd,
+                collateral_usd=pos.collateral_usd,
+                is_long=pos.is_long,
+            )
+            ok, reason = should_execute(
+                plan=plan,
+                min_net_profit_usd=execution_min_net_profit_usd,
+                min_confidence=execution_min_confidence,
+            )
+            if ok:
+                try:
+                    await execute_paper(
+                        plan=plan,
+                        redis_client=redis_client,
+                        log_stream=execution_paper_log_stream,
+                        log_stream_maxlen=execution_paper_log_maxlen,
+                    )
+                    executions_paper += 1
+                except Exception:
+                    log.exception(
+                        "liq_watcher.execute_paper_failed user=%s market=%s",
+                        trigger.user, trigger.market,
+                    )
+            else:
+                executions_rejected += 1
+                log.debug(
+                    "liq_watcher.execution_gate_rejected user=%s market=%s reason=%s",
+                    trigger.user, trigger.market, reason,
+                )
+
     return CycleStats(
         fetched=len(raws),
         parsed=len(raws) - no_alias - no_price,
         no_price=no_price,
         no_alias=no_alias,
         triggers=triggers,
+        executions_paper=executions_paper,
+        executions_rejected=executions_rejected,
     )
 
 
