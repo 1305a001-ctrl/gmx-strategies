@@ -152,12 +152,23 @@ class _FakeRedis:
     def __init__(self, prices: dict[str, dict] | None = None) -> None:
         self.prices = prices or {}
         self.xadds: list[tuple[str, dict]] = []
+        # Generic kv store used by the cooldown gate.
+        self.kv: dict[str, str] = {}
+        self.set_calls: list[tuple[str, str, int | None]] = []
 
     async def get(self, key: str):
+        # Cooldown gate: gmx:execution:cooldown:* keys live in self.kv.
+        if key.startswith("gmx:execution:cooldown:"):
+            return self.kv.get(key)
         for alias, payload in self.prices.items():
             if f":{alias}:" in key:
                 return json.dumps(payload)
         return None
+
+    async def set(self, key: str, value: str, *, ex: int | None = None):
+        self.kv[key] = value
+        self.set_calls.append((key, value, ex))
+        return True
 
     async def xadd(self, stream: str, fields: dict, *, maxlen: int,
                    approximate: bool = True):
@@ -336,6 +347,69 @@ async def test_run_watch_cycle_paper_execution_rejected_by_gate() -> None:
     assert stats.executions_rejected == 1
     streams = [s for s, _ in redis.xadds]
     assert streams == ["gmx:eval_log"]
+
+
+@pytest.mark.asyncio
+async def test_run_watch_cycle_cooldown_suppresses_repeat_fires() -> None:
+    """With cooldown enabled, a previously-fired (user, market) is skipped
+    on the next cycle. The same _FakeRedis instance persists kv state
+    across both cycles, simulating a real cooldown."""
+    pages = [[_gql_row(pid="p1", size=20_000.0, col=2000.0)]]
+    redis = _FakeRedis(prices={"btc": {"price": "70000.0"}})
+
+    # Cycle 1: cooldown miss → fires + sets cooldown key
+    stats1 = await run_watch_cycle(
+        httpx_client=_FakeHttpx(pages), redis_client=redis,
+        subgraph_url="https://example.com",
+        eval_log_stream="gmx:eval_log", eval_log_maxlen=1000,
+        watch_margin=1.05, estimated_fee_usd=100.0,
+        execution_paper_enabled=True,
+        execution_cooldown_sec=300,
+    )
+    assert stats1.executions_paper == 1
+    assert stats1.executions_cooldown == 0
+    # SETEX must have been called for the (user, market) key with ex=300
+    assert len(redis.set_calls) == 1
+    key, _, ex = redis.set_calls[0]
+    assert key.startswith("gmx:execution:cooldown:")
+    assert ex == 300
+
+    # Cycle 2: cooldown hit → skips before build_plan/execute_paper
+    stats2 = await run_watch_cycle(
+        httpx_client=_FakeHttpx(pages), redis_client=redis,
+        subgraph_url="https://example.com",
+        eval_log_stream="gmx:eval_log", eval_log_maxlen=1000,
+        watch_margin=1.05, estimated_fee_usd=100.0,
+        execution_paper_enabled=True,
+        execution_cooldown_sec=300,
+    )
+    assert stats2.executions_paper == 0
+    assert stats2.executions_cooldown == 1
+    # No new set_calls — cooldown was respected
+    assert len(redis.set_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_watch_cycle_cooldown_disabled_with_zero_sec() -> None:
+    """cooldown_sec=0 (default) leaves the existing always-fire behaviour
+    intact — important so legacy callers/tests don't break."""
+    pages = [[_gql_row(pid="p1", size=20_000.0, col=2000.0)]]
+    redis = _FakeRedis(prices={"btc": {"price": "70000.0"}})
+
+    # Two cycles, no cooldown — both should fire.
+    for _ in range(2):
+        stats = await run_watch_cycle(
+            httpx_client=_FakeHttpx(pages), redis_client=redis,
+            subgraph_url="https://example.com",
+            eval_log_stream="gmx:eval_log", eval_log_maxlen=1000,
+            watch_margin=1.05, estimated_fee_usd=100.0,
+            execution_paper_enabled=True,
+            execution_cooldown_sec=0,
+        )
+        assert stats.executions_paper == 1
+        assert stats.executions_cooldown == 0
+    # No SET calls — cooldown wiring is bypassed entirely
+    assert redis.set_calls == []
 
 
 @pytest.mark.asyncio

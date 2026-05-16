@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     execution_min_net_profit_usd: float = 50.0
     execution_min_confidence: float = 0.5
 
+    # Cooldown — suppress re-firing the same (user, market) within this
+    # window. Without this, a single eligible whale is XADDed every cycle
+    # (30s) until they actually get liquidated, producing tens of
+    # thousands of duplicate records per day. 5min default matches the
+    # typical "keeper either fires or the price moves" horizon.
+    execution_cooldown_sec: int = 300
+    execution_cooldown_key_template: str = "gmx:execution:cooldown:{user}:{market}"
+
     # --- Subgraph adapter (paper liquidation discovery) ---
     # Full Goldsky GMX V2 synthetics-Arbitrum URL. Leave empty until
     # Ben pastes the real URL; the loop will no-op safely until then.

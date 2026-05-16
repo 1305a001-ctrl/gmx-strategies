@@ -68,13 +68,17 @@ async def _watcher_loop(stop: asyncio.Event) -> None:
                     execution_paper_log_maxlen=settings.execution_paper_log_maxlen,
                     execution_min_net_profit_usd=settings.execution_min_net_profit_usd,
                     execution_min_confidence=settings.execution_min_confidence,
+                    execution_cooldown_sec=settings.execution_cooldown_sec,
+                    execution_cooldown_key_template=settings.execution_cooldown_key_template,
                 )
                 log.info(
                     "gmx_strategies.cycle fetched=%d parsed=%d no_price=%d "
-                    "no_alias=%d triggers=%d exec_paper=%d exec_rejected=%d",
+                    "no_alias=%d triggers=%d exec_paper=%d exec_rejected=%d "
+                    "exec_cooldown=%d",
                     stats.fetched, stats.parsed, stats.no_price,
                     stats.no_alias, stats.triggers,
                     stats.executions_paper, stats.executions_rejected,
+                    stats.executions_cooldown,
                 )
             except Exception:
                 log.exception("gmx_strategies.cycle_failed")
