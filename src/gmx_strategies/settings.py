@@ -62,6 +62,17 @@ class Settings(BaseSettings):
     execution_cooldown_sec: int = 300
     execution_cooldown_key_template: str = "gmx:execution:cooldown:{user}:{market}"
 
+    # --- On-chain Reader re-check (2026-05-17 G7) ---
+    # When True, the watcher fetches Reader.getPosition() for each
+    # trigger candidate and drops any whose on-chain state shows
+    # size_in_usd == 0 (already closed between subgraph snapshot and
+    # our scan).
+    #
+    # Default OFF — subgraph is fresh enough for paper-mode calibration.
+    # MUST flip to True before live mode (gate enforced at startup).
+    onchain_recheck_enabled: bool = False
+    onchain_recheck_concurrency: int = 8
+
     # --- Subgraph adapter (paper liquidation discovery) ---
     # Full Goldsky GMX V2 synthetics-Arbitrum URL. Leave empty until
     # Ben pastes the real URL; the loop will no-op safely until then.
