@@ -70,6 +70,10 @@ async def _watcher_loop(stop: asyncio.Event) -> None:
                     execution_min_confidence=settings.execution_min_confidence,
                     execution_cooldown_sec=settings.execution_cooldown_sec,
                     execution_cooldown_key_template=settings.execution_cooldown_key_template,
+                    onchain_recheck_enabled=settings.onchain_recheck_enabled,
+                    onchain_recheck_concurrency=settings.onchain_recheck_concurrency,
+                    onchain_rpc_url=settings.arbitrum_rpc_url,
+                    onchain_chain="arbitrum",
                 )
                 log.info(
                     "gmx_strategies.cycle fetched=%d parsed=%d no_price=%d "

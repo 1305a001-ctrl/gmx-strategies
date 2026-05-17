@@ -206,26 +206,29 @@ async def execute_live(
     settings_wallet_address: str,
     settings_private_key: str,
     settings_rpc_url: str,
+    chain: str = "arbitrum",
+    collateral_token_address: str = "",
+    oracle_reports: tuple = (),
     log_stream: str = "gmx:execution:live_log",
     log_stream_maxlen: int = 100_000,
+    submit_timeout_sec: float = 60.0,
 ) -> ExecutionResult:
-    """SCAFFOLD: would build + sign + submit the real liquidate() tx via
-    the GMX V2 Python SDK. NOT YET IMPLEMENTED.
+    """Build + sign + broadcast a real `executeLiquidation` tx via the
+    GMX V2 LiquidationHandler. Gated by four hard checks; refuses on any
+    failure path with a structured error.
 
-    Three hard gates before any on-chain call:
-      1. settings.live_enabled MUST be True (operator flag)
-      2. wallet_address + private_key MUST both be non-empty
-      3. rpc_url MUST be non-empty
+    Caller (liquidation_watcher) must provide:
+      - chain                          'arbitrum' | 'avalanche'
+      - collateral_token_address       0x... of the collateral token
+      - oracle_reports                 tuple[OracleReport, ...] freshly
+                                       pulled from chainlink:<alias>:reports
+                                       Redis stream (max ~10s stale).
 
-    Until the SDK integration is wired, this function REFUSES live
-    execution with reason='sdk_not_wired' so paper-mode soak runs safely.
-
-    To wire live:
-      1. pip install gmx-python (or gmx-sdk — verify package name)
-      2. Replace the `raise NotImplementedError` below with the real
-         build_signed_tx + submit_tx + wait_for_receipt flow
-      3. Add receipt parsing → tx_hash + actual_fee_paid + actual_gas
-      4. Test on Arbitrum Sepolia FIRST (testnet) before mainnet flip
+    Four hard gates (all must pass):
+      1. settings.live_enabled = True
+      2. wallet_address + private_key non-empty
+      3. rpc_url non-empty
+      4. oracle_reports non-empty (no oracle data → no fresh price → revert)
     """
     now = time.time()
 
@@ -247,12 +250,151 @@ async def execute_live(
             plan=plan, accepted=False, mode="live",
             tx_hash="", error="rpc_missing", decided_at_unix=now,
         )
+    # Gate 4: oracle reports
+    if not oracle_reports:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error="oracle_reports_missing", decided_at_unix=now,
+        )
+    # Gate 5: collateral token must be known (caller supplies)
+    if not collateral_token_address:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error="collateral_token_missing", decided_at_unix=now,
+        )
 
-    # Gate 4: SDK not yet wired. Logged + refused.
-    log.warning(
-        "execute_live.sdk_not_wired user=%s market=%s — refusing (paper-only)",
-        plan.user, plan.market,
+    # Lazy imports keep cold-start cheap
+    from gmx_strategies.tx_builder import (
+        LiquidationTxRequest,
+        build_liquidation_tx,
+        chain_id_for,
     )
+    from gmx_strategies.tx_signer import estimate_gas, sign_tx, submit_and_wait
+    from web3 import AsyncHTTPProvider, AsyncWeb3
+
+    cid = chain_id_for(chain)
+    if cid == 0:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error=f"unknown_chain={chain}", decided_at_unix=now,
+        )
+
+    # Fetch nonce. Single RPC round-trip; we don't pre-cache because
+    # accuracy matters more than latency at this scale (~10/day live).
+    try:
+        w3 = AsyncWeb3(AsyncHTTPProvider(settings_rpc_url))
+        nonce = await w3.eth.get_transaction_count(
+            settings_wallet_address, "pending",
+        )
+    except Exception as e:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error=f"nonce_fetch_failed: {e}", decided_at_unix=now,
+        )
+
+    req = LiquidationTxRequest(
+        chain=chain,
+        account=plan.user,
+        market=plan.market,
+        collateral_token=collateral_token_address,
+        is_long=plan.is_long,
+        oracle_reports=oracle_reports,
+        nonce=int(nonce),
+        chain_id=cid,
+        sender_address=settings_wallet_address,
+    )
+
+    # Build
+    try:
+        tx = build_liquidation_tx(req)
+    except Exception as e:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error=f"build_failed: {e}", decided_at_unix=now,
+        )
+
+    # Refine gas via estimate. Bumps the static DEFAULT_GAS_LIMIT down
+    # if the estimator says the real consumption will be lower.
+    try:
+        estimated = await estimate_gas(rpc_url=settings_rpc_url, tx=tx)
+        if estimated > 0:
+            tx["gas"] = estimated
+    except Exception as e:
+        # Estimation failure means the tx would revert. Refuse + log
+        # without burning gas.
+        await _xadd_live_result(
+            redis_client, log_stream, log_stream_maxlen,
+            plan, now, "", f"estimate_revert: {e}",
+        )
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error=f"estimate_revert: {e}", decided_at_unix=now,
+        )
+
+    # Sign
+    try:
+        signed = sign_tx(tx=tx, private_key=settings_private_key)
+    except Exception as e:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error=f"sign_failed: {e}", decided_at_unix=now,
+        )
+
+    # Submit + wait for receipt
+    try:
+        receipt = await submit_and_wait(
+            rpc_url=settings_rpc_url,
+            signed=signed,
+            timeout_sec=submit_timeout_sec,
+        )
+    except Exception as e:
+        return ExecutionResult(
+            plan=plan, accepted=False, mode="live",
+            tx_hash="", error=f"submit_failed: {e}", decided_at_unix=now,
+        )
+
+    success = receipt.status == 1
+    actual_fee_usd = (
+        receipt.gas_used * receipt.effective_gas_price / 10**18 * _ETH_PRICE_USD_FALLBACK
+    )
+    err = "" if success else f"reverted: {receipt.revert_reason}"
+
+    await _xadd_live_result(
+        redis_client, log_stream, log_stream_maxlen,
+        plan, now, receipt.tx_hash, err,
+        gas_used=receipt.gas_used,
+        block_number=receipt.block_number,
+        actual_gas_cost_usd=actual_fee_usd,
+    )
+    return ExecutionResult(
+        plan=plan,
+        accepted=success,
+        mode="live",
+        tx_hash=receipt.tx_hash,
+        error=err,
+        decided_at_unix=now,
+    )
+
+
+# Fallback ETH price for gas cost USD math when we don't have a live
+# Chainlink price loaded. The actual gas cost in ETH is exact; the USD
+# conversion is for log readability.
+_ETH_PRICE_USD_FALLBACK = 3500.0
+
+
+async def _xadd_live_result(
+    redis_client: Any,
+    log_stream: str,
+    log_stream_maxlen: int,
+    plan: ExecutionPlan,
+    now: float,
+    tx_hash: str,
+    error: str,
+    *,
+    gas_used: int = 0,
+    block_number: int = 0,
+    actual_gas_cost_usd: float = 0.0,
+) -> None:
     record = {
         "ts_unix": int(now),
         "user": plan.user,
@@ -261,8 +403,11 @@ async def execute_live(
         "size_usd": f"{plan.size_usd:.4f}",
         "expected_net_pnl_usd": f"{plan.expected_net_pnl_usd:.4f}",
         "mode": "live",
-        "tx_hash": "",
-        "error": "sdk_not_wired",
+        "tx_hash": tx_hash,
+        "error": error,
+        "gas_used": str(gas_used),
+        "block_number": str(block_number),
+        "actual_gas_cost_usd": f"{actual_gas_cost_usd:.4f}",
     }
     try:
         await redis_client.xadd(
@@ -270,24 +415,6 @@ async def execute_live(
         )
     except Exception:
         log.exception("execute_live.xadd_failed")
-    return ExecutionResult(
-        plan=plan, accepted=False, mode="live",
-        tx_hash="", error="sdk_not_wired", decided_at_unix=now,
-    )
-
-    # NOTE: real implementation (week 2+) goes here:
-    # from gmx_python.market_order import LiquidationCall
-    # call = LiquidationCall(
-    #     account=plan.user, market_key=plan.market,
-    #     collateral_token=..., is_long=plan.is_long,
-    # )
-    # tx = call.build(wallet_address=settings_wallet_address)
-    # signed = call.sign(tx, private_key=settings_private_key)
-    # tx_hash = await call.submit(signed, rpc_url=settings_rpc_url)
-    # receipt = await call.wait_for_receipt(tx_hash, timeout=60)
-    # actual_fee_usd = parse_fee_from_receipt(receipt)
-    # actual_gas_usd = parse_gas_from_receipt(receipt)
-    # return ExecutionResult(...)
 
 
 __all__ = [

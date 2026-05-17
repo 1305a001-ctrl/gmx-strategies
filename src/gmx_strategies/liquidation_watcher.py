@@ -117,6 +117,11 @@ async def run_watch_cycle(
     execution_min_confidence: float = 0.5,
     execution_cooldown_sec: int = 0,   # 0 disables cooldown (preserves existing contract)
     execution_cooldown_key_template: str = "gmx:execution:cooldown:{user}:{market}",
+    # G7 (2026-05-17) — on-chain Reader re-check.
+    onchain_recheck_enabled: bool = False,
+    onchain_recheck_concurrency: int = 8,
+    onchain_rpc_url: str = "",
+    onchain_chain: str = "arbitrum",
 ) -> CycleStats:
     """One iteration. Returns stats for logging."""
     raws = await fetch_open_positions(
@@ -134,6 +139,18 @@ async def run_watch_cycle(
     executions_rejected = 0
     executions_cooldown = 0
     amap = alias_map or MARKET_ADDRESS_TO_ALIAS
+
+    # G7 (2026-05-17) — on-chain Reader re-check is gated by the
+    # caller's flag + an RPC URL. The reader itself ships in onchain.py;
+    # the per-cycle wiring is staged so the flag is testable + flippable,
+    # but the actual RPC fetch is deferred until the (chain, market_alias)
+    # → (collateral_token, is_long) map is populated downstream. For
+    # paper-mode, this branch is a no-op log line.
+    if onchain_recheck_enabled and onchain_rpc_url:
+        log.debug(
+            "liq_watcher.onchain_recheck_armed chain=%s concurrency=%d",
+            onchain_chain, onchain_recheck_concurrency,
+        )
 
     # Cache chainlink prices by alias so we hit Redis O(unique-markets), not
     # O(positions).
