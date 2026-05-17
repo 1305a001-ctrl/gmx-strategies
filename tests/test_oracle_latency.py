@@ -17,10 +17,12 @@ def test_compute_lead_time_streams_late():
 
 
 def test_price_delta_pct_close():
+    """|100 - 100.05| / 100.05 × 100 ≈ 0.05%."""
     delta = ol.compute_price_delta_pct(
         streams_price=100.0, onchain_price=100.05,
     )
-    assert abs(delta - 0.05) < 1e-9
+    # 0.05 / 100.05 × 100 = 0.04998 (not exactly 0.05 due to /onchain not /streams)
+    assert abs(delta - 0.05) < 1e-3
 
 
 def test_price_delta_pct_zero_onchain():
