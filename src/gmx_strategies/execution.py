@@ -212,6 +212,11 @@ async def execute_live(
     log_stream: str = "gmx:execution:live_log",
     log_stream_maxlen: int = 100_000,
     submit_timeout_sec: float = 60.0,
+    # Gas budget gate (2026-05-17 wiring). When True, refuse pre-fire
+    # if daily/weekly cap breached or revert breaker tripped. Pass the
+    # current realized PnL so the gate picks the active tier.
+    gas_budget_enabled: bool = False,
+    realized_pnl_usd: float = 0.0,
 ) -> ExecutionResult:
     """Build + sign + broadcast a real `executeLiquidation` tx via the
     GMX V2 LiquidationHandler. Gated by four hard checks; refuses on any
@@ -262,6 +267,18 @@ async def execute_live(
             plan=plan, accepted=False, mode="live",
             tx_hash="", error="collateral_token_missing", decided_at_unix=now,
         )
+
+    # Gate 6: gas budget — refuse if today/this-week's cap is hit OR if
+    # consecutive-revert breaker is tripped. Lazy import to avoid the
+    # cost when the flag is off.
+    if gas_budget_enabled:
+        from gmx_strategies.gas_budget import check_budget_allow
+        allow, gb_reason = await check_budget_allow(realized_pnl_usd=realized_pnl_usd)
+        if not allow:
+            return ExecutionResult(
+                plan=plan, accepted=False, mode="live",
+                tx_hash="", error=f"gas_budget:{gb_reason}", decided_at_unix=now,
+            )
 
     # Lazy imports keep cold-start cheap
     from gmx_strategies.tx_builder import (
@@ -358,6 +375,24 @@ async def execute_live(
         receipt.gas_used * receipt.effective_gas_price / 10**18 * _ETH_PRICE_USD_FALLBACK
     )
     err = "" if success else f"reverted: {receipt.revert_reason}"
+
+    # Record gas spend + maintain circuit breaker. Every confirmed tx
+    # (success OR revert) burns gas; both must increment daily/weekly.
+    # Consecutive-revert counter resets on success, increments on revert.
+    if gas_budget_enabled:
+        from gmx_strategies.gas_budget import (
+            incr_consecutive_reverts,
+            record_gas_spend,
+            reset_consecutive_reverts,
+        )
+        try:
+            await record_gas_spend(actual_fee_usd)
+            if success:
+                await reset_consecutive_reverts()
+            else:
+                await incr_consecutive_reverts()
+        except Exception:
+            log.exception("execute_live.gas_budget_update_failed")
 
     await _xadd_live_result(
         redis_client, log_stream, log_stream_maxlen,
