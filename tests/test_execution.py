@@ -200,8 +200,9 @@ def test_execute_live_refuses_missing_rpc():
     assert result.error == "rpc_missing"
 
 
-def test_execute_live_refuses_sdk_not_wired():
-    """Even with all gates passing, live mode refuses until SDK is wired."""
+def test_execute_live_refuses_without_oracle_reports():
+    """SDK is wired now (2026-05-17); live mode refuses if caller didn't
+    supply oracle reports (would otherwise revert on-chain anyway)."""
     plan = build_plan(
         trigger=_trigger(),
         size_usd=200_000, collateral_usd=500, is_long=True,
@@ -213,10 +214,33 @@ def test_execute_live_refuses_sdk_not_wired():
         settings_wallet_address="0xabc",
         settings_private_key="0xdef" * 10,
         settings_rpc_url="https://arb1.arbitrum.io/rpc",
+        # oracle_reports omitted → refuse before any RPC
     ))
     assert result.accepted is False
-    assert result.error == "sdk_not_wired"
-    # Should still log to Redis even when refusing
-    assert len(r.calls) == 1
-    stream, _ = r.calls[0]
-    assert stream == "gmx:execution:live_log"
+    assert result.error == "oracle_reports_missing"
+
+
+def test_execute_live_refuses_without_collateral_token():
+    """Collateral token address is required for the contract call."""
+    from gmx_strategies.tx_builder import OracleReport
+    plan = build_plan(
+        trigger=_trigger(),
+        size_usd=200_000, collateral_usd=500, is_long=True,
+    )
+    r = _MockRedis()
+    fake_report = OracleReport(
+        token="0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+        provider="0x478Aa2aC9F6D65F84e09D9185d126c3a17c2a93C",
+        data=b"\x01\x02",
+    )
+    result = asyncio.run(execute_live(
+        plan=plan, redis_client=r,
+        settings_live_enabled=True,
+        settings_wallet_address="0xabc",
+        settings_private_key="0xdef" * 10,
+        settings_rpc_url="https://arb1.arbitrum.io/rpc",
+        oracle_reports=(fake_report,),
+        # collateral_token_address omitted → refuse
+    ))
+    assert result.accepted is False
+    assert result.error == "collateral_token_missing"
