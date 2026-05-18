@@ -1,4 +1,5 @@
 """Tests for GMX funding rate arb pure helpers."""
+
 from __future__ import annotations
 
 import pytest

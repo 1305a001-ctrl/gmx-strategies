@@ -1,4 +1,5 @@
 """Market metadata + collateral lookup tests."""
+
 from __future__ import annotations
 
 from gmx_strategies import markets

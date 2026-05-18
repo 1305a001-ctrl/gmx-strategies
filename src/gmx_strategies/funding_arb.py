@@ -12,6 +12,7 @@ Mechanics:
   hedge it on a CEX (long ETH on Binance). Net direction exposure: 0.
   Net income: the funding rate.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,13 +23,13 @@ class FundingState:
     market: str
     longs_oi_usd: float
     shorts_oi_usd: float
-    funding_rate_per_8h: float    # signed; positive = longs pay shorts
+    funding_rate_per_8h: float  # signed; positive = longs pay shorts
 
 
 @dataclass(frozen=True)
 class FundingArbSignal:
     market: str
-    direction: str                # 'short_gmx_long_cex' or 'long_gmx_short_cex'
+    direction: str  # 'short_gmx_long_cex' or 'long_gmx_short_cex'
     funding_rate_per_8h: float
     annualized_yield_pct: float
     target_position_usd: float

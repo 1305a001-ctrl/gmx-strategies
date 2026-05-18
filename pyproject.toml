@@ -7,8 +7,8 @@ where = ["src"]
 
 [project]
 name = "gmx-strategies"
-version = "0.1.0"
-description = "GMX V2 strategies — liquidation triggering (Data Streams edge), funding rate arb, Keeper bot."
+version = "0.2.0"
+description = "GMX V2 strategies — funding-rate arbitrage (delta-neutral). v0.2 removed liquidation-triggering after architecture audit."
 requires-python = ">=3.11"
 dependencies = [
     # Pinned to specific versions to mitigate supply-chain risk.
