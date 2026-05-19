@@ -64,15 +64,29 @@ so the loop body stays untouched when the live readers land.
 
 ## What's TODO (v0.3+)
 
-- **G2** — GMX V2 Reader integration (web3 read of OI + funding rates per market).
+- **G2** — GMX V2 Reader integration (web3 read of OI + funding rates per market). See "G2 integration shape" below for the verified Reader/DataStore addresses + function signature so the wiring doesn't burn a session on stale architecture (Polymarket lesson).
 - **G3** — Binance perp funding-rate read (CEX hedge leg).
 - **G4** — paper-trade harness scoring (eval log -> Sharpe / fill-quality).
-- **Markets gap** — operator's intended monitored set is `btc,eth,sol,doge,xrp`
-  (intersect of live Chainlink Data Streams feeds and GMX V2 Arbitrum perps).
-  Currently `markets.py` only has verified addresses for `btc,eth,sol` (plus
-  `link,arb,wsteth` left over from earlier work). `doge` and `xrp` are silently
-  skipped by the runtime until their GMX V2 market addresses are verified against
-  `gmx-io/gmx-synthetics/deployments/arbitrum/` and added.
+
+All 5 intended markets (`btc,eth,sol,doge,xrp`) are now in `markets.py` with verified addresses (see commit `feat(markets)`). DOGE + XRP confirmed live on the current Reader 2026-05-20. The stale `wsteth` entry was removed in the same pass — GMX delisted that market and `Reader.getMarket()` returns a zero-struct for the old address.
+
+## G2 integration shape (verified 2026-05-20)
+
+When G2 wires `fetch_gmx_funding` against web3, use these:
+
+| Item | Value | Notes |
+|---|---|---|
+| **Reader** | `0x470fbC46bcC0f16532691Df360A07d8Bf5ee0789` | Current Arbitrum Reader (per `gmx-io/gmx-synthetics/deployments/arbitrum/Reader.json`). Note: this differs from the address cited in the 2026-05-18 GMX audit memo (`0xf60b…d139`) — Reader was redeployed. Always re-verify against `gmx-io/gmx-synthetics/deployments/arbitrum/Reader.json` at integration time, not from this README. |
+| **DataStore** | `0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8` | Stable. Used as first param of every Reader call. |
+| **Funding/OI read** | `Reader.getMarketInfo(DataStore, MarketUtils.MarketPrices[], address marketKey)` returns `ReaderUtils.MarketInfo` | One call per market. Construct `MarketPrices` from current Streams prices (index/long/short token min/max). |
+| **MarketInfo fields used** | `.nextFunding.fundingFactorPerSecond` (the rate), `.nextFunding.longsPayShorts` (sign), `.isDisabled` (skip if true), `.borrowingFactorPerSecondForLongs/Shorts` (gross-vs-net math) | Convert `fundingFactorPerSecond` to `funding_rate_per_8h` for the existing `FundingState` shape: `rate_per_8h = factor_per_second * 8 * 3600 / 1e30` (GMX uses 30-decimal fixed-point for factors). |
+| **OI per side** | `Reader.getOpenInterestWithPnl(DataStore, Market.Props, indexTokenPrice, isLong, maximize)` returns `int256` (PnL-adjusted) | Call twice (isLong=true/false) for `longs_oi_usd` / `shorts_oi_usd`. Or read raw via `DataStore.getUint(MarketUtils.openInterestKey(market, collateralToken, isLong))` — cheaper if PnL adjustment isn't needed. |
+
+**Verification checklist before flipping G2 live**:
+1. Re-read `gmx-io/gmx-synthetics/deployments/arbitrum/Reader.json` for the current address (don't trust this README — Reader could be redeployed again).
+2. Confirm each entry in `ARBITRUM_MARKETS` returns a non-zero-struct from `Reader.getMarket(DataStore, marketAddress)` (script at `/tmp/gmx_market_verify.py` documents the call pattern).
+3. Confirm `MarketInfo.isDisabled == false` for each market before emitting signals.
+4. Match the funding-rate scaling against a known mark via the GMX UI to confirm the 30-decimal conversion is correct.
 
 ## Tests
 

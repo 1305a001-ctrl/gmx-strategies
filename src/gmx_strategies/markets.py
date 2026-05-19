@@ -38,7 +38,6 @@ _ARB_USDC = "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
 _ARB_LINK = "0xf97f4df75117a78c1a5a0dbb814af92458539fb4"
 _ARB_ARB = "0x912ce59144191c1204e64559fe8253a0e49e6548"
 _ARB_WSOL = "0x2bcc6d6cdbbdc0a4071e48bb3b969b06b3330c07"  # Wormhole SOL on Arbitrum
-_ARB_WSTETH = "0x5979d7b546e38e414f7e9822514be443a4800529"
 
 
 ARBITRUM_MARKETS: dict[str, GMXMarket] = {
@@ -77,17 +76,18 @@ ARBITRUM_MARKETS: dict[str, GMXMarket] = {
         long_collateral_token=_ARB_ARB,
         short_collateral_token=_ARB_USDC,
     ),
-    "wsteth": GMXMarket(
-        alias="wsteth",
-        chain="arbitrum",
-        market_address="0x0Cf1fb4d1FF67A3D8Ca92c9d6643F8F9be8e03E4",
-        long_collateral_token=_ARB_WSTETH,
-        short_collateral_token=_ARB_USDC,
-    ),
+    # NOTE: wsteth was a GMX V2 Arbitrum market in earlier versions but
+    # has been delisted — Reader.getMarket() returns a zero-struct for
+    # 0x0Cf1fb4d1FF67A3D8Ca92c9d6643F8F9be8e03E4 against the current
+    # Reader 0x470fbC46bcC0f16532691Df360A07d8Bf5ee0789 (verified
+    # 2026-05-20). Removed to prevent G2 from polling a ghost market.
+    # If GMX re-adds wsteth as a perp, repopulate with the new address.
+
     # DOGE + XRP are synthetic-index markets on GMX V2 Arbitrum — no native
     # ERC20 for the index. Long/short collateral is WETH/USDC per
     # synthetics config (gmx-io/gmx-interface sdk/src/configs/markets.ts).
-    # Verified deployed via eth_getCode on Arbitrum mainnet 2026-05-20.
+    # Verified deployed + alive via Reader.getMarket() on Arbitrum
+    # mainnet 2026-05-20 against the current Reader 0x470f…0789.
     "doge": GMXMarket(
         alias="doge",
         chain="arbitrum",

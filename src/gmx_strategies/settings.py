@@ -17,7 +17,9 @@ class Settings(BaseSettings):
 
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
-    monitored_markets: str = "btc,eth,sol,wsteth"
+    # 5 Arbitrum perp markets that overlap our 7 live Streams feeds.
+    # BNB + HYPE feeds excluded — no GMX V2 market for either.
+    monitored_markets: str = "btc,eth,sol,doge,xrp"
 
     # --- Funding rate arb (delta-neutral) ---
     # Min absolute funding rate (per 8 hours, fraction) to consider opening.
