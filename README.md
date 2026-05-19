@@ -172,3 +172,39 @@ docker exec gmx-strategies python -m gmx_strategies.cli watchdog
 - Max 3 concurrent positions until proven
 - Trading wallet keys NEVER in Claude sessions
 - v0.3 runtime is paper-only; no live web3 calls, no live CEX calls
+
+## G6 (CEX hedge leg)
+
+`src/gmx_strategies/binance_exchange_info.py` — the first G6 module. Reads the
+public `/fapi/v1/exchangeInfo` endpoint, parses per-symbol LOT_SIZE /
+MARKET_LOT_SIZE / PRICE_FILTER / MIN_NOTIONAL filters into a frozen
+`SymbolInfo`, caches the result with a TTL, and exposes Decimal-backed pure
+helpers (`round_qty_down`, `round_price`, `passes_min_notional`,
+`quantity_from_notional`) that the downstream executor MUST go through before
+submitting any order. Without these checks the first BTC hedge would reject
+silently with Binance `-4164 MIN_NOTIONAL` or `-1111 PRECISION`.
+
+**Why this is load-bearing**: per the audit
+(`memory/arch_binance_executor_audit.md` §7 / H1), BTCUSDT's min_notional is
+several × above the operator's $10/trade cap. Hardcoding filter values is a
+trap because Binance bumps them silently during volatile episodes.
+
+**Smoke (2026-05-20, fapi.binance.com mainnet)** — 740 symbols parsed; the
+5 G6 targets:
+
+| Symbol  | lot_step | lot_min | price_tick | min_notional |
+|---------|---------:|--------:|-----------:|-------------:|
+| BTCUSDT |    0.001 |   0.001 |        0.1 |          $50 |
+| ETHUSDT |    0.001 |   0.001 |       0.01 |          $20 |
+| SOLUSDT |     0.01 |    0.01 |       0.01 |           $5 |
+| DOGEUSDT|        1 |       1 |    0.00001 |           $5 |
+| XRPUSDT |      0.1 |     0.1 |     0.0001 |           $5 |
+
+Audit had estimated BTCUSDT min_notional ≈ $100; actual on 2026-05-20 is
+$50 (still 5x the $10 cap — BTC remains unusable at the current cap; G6
+must either raise the per-symbol cap or drop BTC from the hedge basket).
+SOL/DOGE/XRP are tradeable at $5 + cap.
+
+**NOT in this PR** (deferred to G6.2+): HMAC signing, order placement,
+position-mode (one-way vs hedge) check, `marginType` / `leverage` POSTs.
+Public endpoint, no auth.
