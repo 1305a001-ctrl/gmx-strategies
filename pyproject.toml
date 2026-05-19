@@ -7,8 +7,9 @@ where = ["src"]
 
 [project]
 name = "gmx-strategies"
-version = "0.4.0"
-description = "GMX V2 strategies — funding-rate arbitrage (delta-neutral). v0.3 paper-mode runtime scaffold; v0.4 adds live GMX V2 Reader integration (G2)."
+version = "0.5.0"
+description = "GMX V2 strategies — funding-rate arbitrage (delta-neutral). v0.3 paper-mode runtime scaffold; v0.4 adds live GMX V2 Reader integration (G2); v0.5 adds live Binance perp funding-rate reader for CEX hedge leg (G3)."
+
 requires-python = ">=3.11"
 dependencies = [
     # Pinned to specific versions to mitigate supply-chain risk.
