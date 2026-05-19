@@ -62,6 +62,38 @@ chainlink-streams (Go) -> Redis chainlink:{btc,eth,sol,...}:latest
 Both are injected through `run_funding_arb_runtime(gmx_fetcher=..., cex_fetcher=...)`
 so the loop body stays untouched when the live readers land.
 
+## v0.4 — G2: live GMX V2 Reader integration
+
+`src/gmx_strategies/gmx_reader.py` implements `fetch_gmx_funding_live(market, chain)`
+against Arbitrum mainnet. Three RPC calls per market:
+
+1. `Reader.getMarket(DataStore, marketAddress)` — pulls Market.Props for the
+   indexToken / longToken / shortToken triple.
+2. `Reader.getMarketInfo(DataStore, MarketPrices, marketAddress)` — decodes
+   `nextFunding.fundingFactorPerSecond` (30-decimal fixed-point) +
+   `nextFunding.longsPayShorts` (sign) + `isDisabled`.
+3. Four `DataStore.getUint(openInterestKey(market, collateralToken, isLong))`
+   calls (long-collateral and short-collateral, twice per side) summed
+   per `MarketUtils.getOpenInterest` semantics.
+
+**Price source.** The MarketPrices struct uses prices from the operator's
+`chainlink-streams` Redis topology (`chainlink:{alias}:latest`,
+`benchmark_price_float64`). No external API — the on-chain read uses the
+same oracle stack the rest of the trading stack already depends on.
+
+**Switching modes.** Default is `settings.gmx_funding_source = "mock"`
+(opt-in to live). Override via env:
+```
+GMX_FUNDING_SOURCE=live python -m gmx_strategies.main
+```
+LIVE_ENABLED gate untouched — the runtime still emits to `funding_arb:signals`
+in paper mode; G2 just makes the signals reflect real on-chain conditions.
+
+**Failure handling.** `fetch_gmx_funding_live` returns `None` on any failure
+(disabled market, missing Streams price, RPC revert, decode failure). The
+runtime wrapper raises on None so the existing `_process_market` per-market
+try/except handles it uniformly — one bad market never kills the sweep.
+
 ## What's TODO (v0.3+)
 
 - **G2** — GMX V2 Reader integration (web3 read of OI + funding rates per market). See "G2 integration shape" below for the verified Reader/DataStore addresses + function signature so the wiring doesn't burn a session on stale architecture (Polymarket lesson).

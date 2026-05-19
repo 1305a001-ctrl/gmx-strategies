@@ -1,29 +1,34 @@
 """Funding-arb runtime — paper-mode loop wiring around pure helpers.
 
-v0.3 scaffold (G1 in the funding-arb wiring sequence).
+v0.3 scaffold (G1) + G2 live-reader switch.
 
 What this module does:
   - Iterates monitored Arbitrum GMX V2 markets (filtered against markets.py).
-  - For each market, fetches a FundingState via `fetch_gmx_funding` (paper stub).
+  - For each market, fetches a FundingState via either:
+      * `fetch_gmx_funding_mock` (default, settings.gmx_funding_source="mock")
+      * `gmx_reader.fetch_gmx_funding_live` (settings.gmx_funding_source="live")
   - Fetches the would-be hedge venue funding via `fetch_cex_funding` (paper stub).
   - Runs the pure `detect_signal()` helper.
   - On a hit, emits the signal to Redis pub/sub channel `funding_arb:signals`
     AND XADD-s it to `funding_arb:eval_log`. mode="paper" is hard-coded.
   - Sleeps `funding_arb_poll_interval_s` between sweeps.
 
-What this module deliberately does NOT do (G2/G3 territory):
-  - No live web3 reads. `fetch_gmx_funding` returns mocked data.
+What this module deliberately does NOT do (G3+ territory):
   - No live Binance API. `fetch_cex_funding` returns a mocked constant.
   - No order placement. No live execution. LIVE_ENABLED gate untouched.
 
 Injection points for later phases:
   Pass custom `gmx_fetcher` / `cex_fetcher` callables to `run_funding_arb_runtime`.
-  This is how tests drive the loop and how G2/G3 will swap in real fetchers
-  without touching the loop body.
+  This is how tests drive the loop and how G3 will swap in real fetchers
+  without touching the loop body. The default `gmx_fetcher` is picked by
+  `_default_gmx_fetcher()` at call-time from settings.
 
 Error handling:
   A fetcher raising for one market is logged and skipped — never kills the
-  loop. The next market in the sweep proceeds normally.
+  loop. The next market in the sweep proceeds normally. The live reader's
+  `_fetch_gmx_funding_live_wrapper` converts a `None` (any failure inside
+  `fetch_gmx_funding_live`) to a raise so the existing per-market try/except
+  handles it uniformly.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from collections.abc import Awaitable, Callable
 from typing import Final
 
 from gmx_strategies.funding_arb import FundingState, detect_signal
+from gmx_strategies.gmx_reader import fetch_gmx_funding_live
 from gmx_strategies.markets import ARBITRUM_MARKETS
 from gmx_strategies.redis_client import r
 from gmx_strategies.settings import settings
@@ -53,12 +59,13 @@ GmxFetcher = Callable[[str], Awaitable[FundingState]]
 CexFetcher = Callable[[str], Awaitable[float]]
 
 
-async def fetch_gmx_funding(market: str) -> FundingState:
+async def fetch_gmx_funding_mock(market: str) -> FundingState:
     """Paper-mode placeholder for the GMX V2 funding-rate read.
 
-    Returns a deterministic mock FundingState. G2 will replace this with a
-    web3 read against the GMX Reader (or a subgraph fallback). The signature
-    is the live shape: alias -> FundingState.
+    Returns a deterministic mock FundingState. G2 wired the live reader
+    in `gmx_reader.fetch_gmx_funding_live`; this mock remains as the
+    default (settings.gmx_funding_source == "mock") so the operator must
+    explicitly opt into live reads.
 
     The mock biases btc/eth toward long-skew + small positive funding so the
     runtime exercises the emit path under default thresholds; sol/doge/xrp
@@ -104,6 +111,40 @@ async def fetch_gmx_funding(market: str) -> FundingState:
             funding_rate_per_8h=0.0,
         )
     return presets[market]
+
+
+async def _fetch_gmx_funding_live_wrapper(market: str) -> FundingState:
+    """Adapter: convert `fetch_gmx_funding_live` (returns FundingState | None)
+    into the strict `GmxFetcher` shape (returns FundingState, raises on None).
+
+    `_process_market` catches Exception and skips the market — so raising
+    here on a None result preserves the loop-survival contract.
+    """
+    state = await fetch_gmx_funding_live(market, chain="arbitrum")
+    if state is None:
+        raise RuntimeError(f"live GMX reader returned None for market={market}")
+    return state
+
+
+# Back-compat: existing tests patch `fetch_gmx_funding`; keep the symbol
+# pointing at the default fetcher (which the tests have always assumed is
+# the mock path). The live path is opted-in via settings.gmx_funding_source.
+fetch_gmx_funding = fetch_gmx_funding_mock
+
+
+def _default_gmx_fetcher() -> GmxFetcher:
+    """Pick the default fetcher per settings — runs at call-time, not import-time,
+    so env overrides for `gmx_funding_source` are respected on each call.
+    """
+    if settings.gmx_funding_source == "live":
+        return _fetch_gmx_funding_live_wrapper
+    # The module attribute `fetch_gmx_funding` is what existing tests patch,
+    # so we read it dynamically rather than capturing the function object
+    # at definition time.
+    import sys
+
+    mod = sys.modules[__name__]
+    return mod.fetch_gmx_funding  # type: ignore[no-any-return]
 
 
 async def fetch_cex_funding(symbol: str) -> float:
@@ -242,7 +283,7 @@ async def run_funding_arb_runtime(
         iterations: when set, run exactly N sweeps then return (test hook).
             None = run forever.
     """
-    gmx = gmx_fetcher or fetch_gmx_funding
+    gmx = gmx_fetcher or _default_gmx_fetcher()
     cex = cex_fetcher or fetch_cex_funding
     markets = _resolve_markets()
     log.info(
@@ -288,5 +329,6 @@ __all__ = [
     "GmxFetcher",
     "fetch_cex_funding",
     "fetch_gmx_funding",
+    "fetch_gmx_funding_mock",
     "run_funding_arb_runtime",
 ]
