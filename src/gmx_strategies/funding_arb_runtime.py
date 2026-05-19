@@ -1,34 +1,43 @@
 """Funding-arb runtime — paper-mode loop wiring around pure helpers.
 
-v0.3 scaffold (G1) + G2 live-reader switch.
+v0.3 scaffold (G1) + G2 live-reader switch + G3 Binance CEX leg.
 
 What this module does:
   - Iterates monitored Arbitrum GMX V2 markets (filtered against markets.py).
   - For each market, fetches a FundingState via either:
       * `fetch_gmx_funding_mock` (default, settings.gmx_funding_source="mock")
       * `gmx_reader.fetch_gmx_funding_live` (settings.gmx_funding_source="live")
-  - Fetches the would-be hedge venue funding via `fetch_cex_funding` (paper stub).
-  - Runs the pure `detect_signal()` helper.
+  - For each market, fetches the CEX (Binance) hedge funding rate via either:
+      * `fetch_cex_funding` zero-stub (default, settings.binance_funding_source="mock")
+      * `binance_funding.fetch_cex_funding_live` (settings.binance_funding_source="live")
+      * `binance_funding.fetch_all_cex_fundings` (one batched call per sweep, when
+         settings.binance_funding_batch=True — much cheaper at 60s cadence).
+  - Runs the pure `detect_signal()` helper. NOTE: detect_signal is intentionally
+    venue-agnostic — it takes ONLY the GMX FundingState. The CEX rate composes
+    into the EMIT payload (as `cex_rate_per_8h` + `net_rate_per_8h`), not the
+    trigger. Reason: keep the pure helper clean; net-rate-based detection is a
+    separate decision for later.
   - On a hit, emits the signal to Redis pub/sub channel `funding_arb:signals`
     AND XADD-s it to `funding_arb:eval_log`. mode="paper" is hard-coded.
   - Sleeps `funding_arb_poll_interval_s` between sweeps.
 
-What this module deliberately does NOT do (G3+ territory):
-  - No live Binance API. `fetch_cex_funding` returns a mocked constant.
+What this module deliberately does NOT do:
   - No order placement. No live execution. LIVE_ENABLED gate untouched.
 
 Injection points for later phases:
   Pass custom `gmx_fetcher` / `cex_fetcher` callables to `run_funding_arb_runtime`.
-  This is how tests drive the loop and how G3 will swap in real fetchers
-  without touching the loop body. The default `gmx_fetcher` is picked by
-  `_default_gmx_fetcher()` at call-time from settings.
+  This is how tests drive the loop and how the live fetchers swap in without
+  touching the loop body. The default fetchers are picked by `_default_*_fetcher()`
+  at call-time from settings.
 
 Error handling:
   A fetcher raising for one market is logged and skipped — never kills the
-  loop. The next market in the sweep proceeds normally. The live reader's
+  loop. The next market in the sweep proceeds normally. The live GMX reader's
   `_fetch_gmx_funding_live_wrapper` converts a `None` (any failure inside
   `fetch_gmx_funding_live`) to a raise so the existing per-market try/except
-  handles it uniformly.
+  handles it uniformly. The CEX leg is more forgiving: a None/failure does
+  NOT block the signal — net_rate falls back to gmx_rate (cex=0) and the
+  payload's `cex_source` becomes "mock_fallback".
 """
 
 from __future__ import annotations
@@ -40,6 +49,10 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Final
 
+from gmx_strategies.binance_funding import (
+    fetch_all_cex_fundings,
+    fetch_cex_funding_live,
+)
 from gmx_strategies.funding_arb import FundingState, detect_signal
 from gmx_strategies.gmx_reader import fetch_gmx_funding_live
 from gmx_strategies.markets import ARBITRUM_MARKETS
@@ -56,7 +69,10 @@ log = logging.getLogger(__name__)
 _INTENDED_MARKETS: Final[tuple[str, ...]] = ("btc", "eth", "sol", "doge", "xrp")
 
 GmxFetcher = Callable[[str], Awaitable[FundingState]]
-CexFetcher = Callable[[str], Awaitable[float]]
+# CexFetcher returns float (mock path, never None) OR float | None (live path,
+# None on transient failure → falls back to 0.0 with cex_source="mock_fallback").
+# The Union keeps back-compat with the G1 mock signature.
+CexFetcher = Callable[[str], Awaitable[float | None]]
 
 
 async def fetch_gmx_funding_mock(market: str) -> FundingState:
@@ -150,10 +166,36 @@ def _default_gmx_fetcher() -> GmxFetcher:
 async def fetch_cex_funding(symbol: str) -> float:
     """Paper-mode placeholder for the CEX (Binance) perp funding read.
 
-    Returns a mock 8h funding rate as a float. G3 will replace this with a
-    Binance premiumIndex call. Signature is the live shape: symbol -> rate.
+    Returns a constant 0.0 — keeps `net_rate == gmx_rate` for mock-mode emits.
+    The live path (`binance_funding.fetch_cex_funding_live`) is opted in via
+    `settings.binance_funding_source = "live"`.
+
+    Signature is the legacy single-market shape kept for the existing
+    `cex_fetcher` injection point in tests.
     """
+    _ = symbol
     return 0.0
+
+
+def _default_cex_fetcher() -> CexFetcher:
+    """Pick the default CEX fetcher per settings — runs at call-time so env
+    overrides for `binance_funding_source` are respected on each call.
+
+    When `binance_funding_source == "live"` AND `binance_funding_batch == False`,
+    the per-market live fetcher is returned. The batched path is handled
+    separately in `run_funding_arb_runtime` because it makes ONE HTTP call
+    per sweep, not per market — it doesn't fit the per-market fetcher shape.
+
+    For tests that patch `fetch_cex_funding` at module level (back-compat with
+    G1 tests), we read it dynamically through `sys.modules` rather than
+    capturing the function object at definition time.
+    """
+    if settings.binance_funding_source == "live" and not settings.binance_funding_batch:
+        return fetch_cex_funding_live
+    import sys
+
+    mod = sys.modules[__name__]
+    return mod.fetch_cex_funding  # type: ignore[no-any-return]
 
 
 def _signal_payload(
@@ -163,8 +205,23 @@ def _signal_payload(
     funding_rate_per_8h: float,
     annualized_yield_pct: float,
     target_position_usd: float,
+    cex_rate_per_8h: float,
+    net_rate_per_8h: float,
+    cex_source: str,
 ) -> dict[str, object]:
-    """Build the JSON-serializable emit payload (shape locked for G2/G3)."""
+    """Build the JSON-serializable emit payload.
+
+    G3 extends the G2 payload with 3 fields:
+      - `cex_rate_per_8h`: Binance funding rate (GMX convention, same sign).
+      - `net_rate_per_8h`: gmx_rate - cex_rate. THIS is the actual edge —
+        downstream consumers should prefer this over `funding_rate_per_8h`
+        for sizing/PnL projections.
+      - `cex_source`: "mock" | "binance" | "mock_fallback" (live attempted
+        but failed, treated as 0.0).
+
+    The existing field `funding_rate_per_8h` continues to mean the GMX-side
+    rate — unchanged from G1/G2 so downstream consumers don't break.
+    """
     return {
         "ts": int(time.time()),
         "market": market,
@@ -172,6 +229,9 @@ def _signal_payload(
         "funding_rate_per_8h": funding_rate_per_8h,
         "annualized_yield_pct": annualized_yield_pct,
         "target_position_usd": target_position_usd,
+        "cex_rate_per_8h": cex_rate_per_8h,
+        "net_rate_per_8h": net_rate_per_8h,
+        "cex_source": cex_source,
         "mode": "paper",
     }
 
@@ -209,22 +269,71 @@ async def _process_market(
     *,
     gmx_fetcher: GmxFetcher,
     cex_fetcher: CexFetcher,
+    cex_cache: dict[str, float] | None = None,
 ) -> bool:
     """One market poll. Returns True iff a signal was emitted.
 
-    Exceptions from EITHER fetcher are caught here so a single bad market
-    does not kill the sweep. The next market continues normally.
+    GMX-fetcher exceptions kill THIS market's signal (loop survives, next
+    market proceeds normally — the funding-arb edge needs GMX data).
+
+    CEX-fetcher exceptions and `None` returns are RECOVERABLE: log the
+    failure, treat cex_rate as 0.0 (so net_rate falls back to gmx_rate),
+    set cex_source="mock_fallback", and STILL ship the signal. Downstream
+    consumers can decide whether to act on a signal with no hedge data.
+
+    Args:
+        cex_cache: when present, the CEX rate is read from this dict (the
+            batched-mode path populates it once per sweep) instead of
+            calling `cex_fetcher`. Missing keys fall back to mock_fallback.
     """
+    # ---- GMX leg: hard dependency for signal generation ----
     try:
         state = await gmx_fetcher(market)
-        # The CEX leg is fetched even though detect_signal doesn't consume it
-        # directly — it's logged for parity with G3 wiring + so a broken CEX
-        # fetcher surfaces here, in the per-market try, not at sweep level.
-        cex_rate = await cex_fetcher(market)
-    except Exception as exc:  # noqa: BLE001 — graceful per-market degradation
-        log.warning("funding_arb.fetch_failed market=%s err=%s", market, exc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("funding_arb.gmx_fetch_failed market=%s err=%s", market, exc)
         return False
 
+    # ---- CEX leg: optional; failure does NOT block the signal ----
+    cex_source: str
+    cex_rate: float
+    if cex_cache is not None:
+        # Batched path — the cache is pre-populated for this sweep.
+        cached = cex_cache.get(market)
+        if cached is None:
+            log.warning(
+                "funding_arb.cex_cache_miss market=%s — emitting with mock_fallback",
+                market,
+            )
+            cex_rate = 0.0
+            cex_source = "mock_fallback"
+        else:
+            cex_rate = cached
+            cex_source = "binance"
+    else:
+        # Per-market path — call the injected fetcher.
+        try:
+            result = await cex_fetcher(market)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "funding_arb.cex_fetch_failed market=%s err=%s — emitting with mock_fallback",
+                market, exc,
+            )
+            result = None
+        if result is None:
+            cex_rate = 0.0
+            # Distinguish "we never tried live" (mock path) vs "live attempted
+            # and failed". The mock stub returns 0.0 (not None), so a None here
+            # is always from the live path failing.
+            cex_source = "mock_fallback" if (
+                settings.binance_funding_source == "live"
+            ) else "mock"
+        else:
+            cex_rate = float(result)
+            cex_source = (
+                "binance" if settings.binance_funding_source == "live" else "mock"
+            )
+
+    # Signal detection is GMX-only (pure helper stays venue-agnostic).
     signal = detect_signal(
         state,
         min_rate=settings.funding_arb_min_rate,
@@ -232,22 +341,28 @@ async def _process_market(
     )
     if signal is None:
         log.debug(
-            "funding_arb.no_signal market=%s rate_per_8h=%s cex_rate=%s",
+            "funding_arb.no_signal market=%s gmx_rate=%s cex_rate=%s",
             market, state.funding_rate_per_8h, cex_rate,
         )
         return False
 
+    net_rate = signal.funding_rate_per_8h - cex_rate
     payload = _signal_payload(
         market=signal.market,
         direction=signal.direction,
         funding_rate_per_8h=signal.funding_rate_per_8h,
         annualized_yield_pct=signal.annualized_yield_pct,
         target_position_usd=signal.target_position_usd,
+        cex_rate_per_8h=cex_rate,
+        net_rate_per_8h=net_rate,
+        cex_source=cex_source,
     )
     await _emit_signal(payload)
     log.info(
-        "funding_arb.signal_emitted market=%s direction=%s annualized=%.2f%% cex_rate=%s",
-        signal.market, signal.direction, signal.annualized_yield_pct, cex_rate,
+        "funding_arb.signal_emitted market=%s direction=%s annualized=%.2f%% "
+        "gmx_rate=%.6f cex_rate=%.6f net_rate=%.6f cex_source=%s",
+        signal.market, signal.direction, signal.annualized_yield_pct,
+        signal.funding_rate_per_8h, cex_rate, net_rate, cex_source,
     )
     return True
 
@@ -278,29 +393,67 @@ async def run_funding_arb_runtime(
     """Main async loop. Paper mode only.
 
     Args:
-        gmx_fetcher: override the GMX funding fetcher (tests / future G2).
-        cex_fetcher: override the CEX funding fetcher (tests / future G3).
+        gmx_fetcher: override the GMX funding fetcher (tests).
+        cex_fetcher: override the CEX funding fetcher (tests). When None,
+            the default is picked from settings — see `_default_cex_fetcher`.
         iterations: when set, run exactly N sweeps then return (test hook).
             None = run forever.
+
+    Batched CEX path (default):
+      When `settings.binance_funding_source == "live"` AND
+      `settings.binance_funding_batch == True` AND no explicit `cex_fetcher`
+      override is passed, we call `fetch_all_cex_fundings()` ONCE per sweep
+      and dispatch the cached rates into `_process_market`. This is 5× fewer
+      HTTP calls per sweep compared to per-market fetches.
+
+      An injected `cex_fetcher` overrides this — tests can still drive the
+      per-market path even when settings would otherwise pick the batched one.
     """
     gmx = gmx_fetcher or _default_gmx_fetcher()
-    cex = cex_fetcher or fetch_cex_funding
+    use_batched_cex = (
+        cex_fetcher is None
+        and settings.binance_funding_source == "live"
+        and settings.binance_funding_batch
+    )
+    cex = cex_fetcher or _default_cex_fetcher()
     markets = _resolve_markets()
     log.info(
-        "funding_arb.runtime_start markets=%s poll_s=%s min_rate=%s",
+        "funding_arb.runtime_start markets=%s poll_s=%s min_rate=%s "
+        "gmx_source=%s cex_source=%s batched_cex=%s",
         ",".join(markets), settings.funding_arb_poll_interval_s,
         settings.funding_arb_min_rate,
+        settings.gmx_funding_source, settings.binance_funding_source,
+        use_batched_cex,
     )
 
     sweep = 0
     while iterations is None or sweep < iterations:
+        # In batched-CEX mode, fetch all CEX rates ONCE per sweep, then
+        # dispatch the cache to _process_market. The cache is None for the
+        # per-market path (the legacy default + the live single-market path).
+        cex_cache: dict[str, float] | None = None
+        if use_batched_cex:
+            try:
+                cex_cache = await fetch_all_cex_fundings()
+            except Exception as exc:  # noqa: BLE001
+                # Batched fetch failures fall back to empty cache → every
+                # market in this sweep emits with cex_source="mock_fallback".
+                log.warning(
+                    "funding_arb.batched_cex_failed err=%s — sweep proceeds with empty cache",
+                    exc,
+                )
+                cex_cache = {}
+
         polled = 0
         emitted = 0
         errors = 0
         for market in markets:
             try:
                 fired = await _process_market(
-                    market, gmx_fetcher=gmx, cex_fetcher=cex,
+                    market,
+                    gmx_fetcher=gmx,
+                    cex_fetcher=cex,
+                    cex_cache=cex_cache,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Defensive: _process_market already catches fetch errors;
@@ -330,5 +483,7 @@ __all__ = [
     "fetch_cex_funding",
     "fetch_gmx_funding",
     "fetch_gmx_funding_mock",
+    "fetch_all_cex_fundings",
+    "fetch_cex_funding_live",
     "run_funding_arb_runtime",
 ]
