@@ -7,8 +7,8 @@ where = ["src"]
 
 [project]
 name = "gmx-strategies"
-version = "0.3.0"
-description = "GMX V2 strategies — funding-rate arbitrage (delta-neutral). v0.3 adds paper-mode runtime scaffold around pure helpers."
+version = "0.4.0"
+description = "GMX V2 strategies — funding-rate arbitrage (delta-neutral). v0.3 paper-mode runtime scaffold; v0.4 adds live GMX V2 Reader integration (G2)."
 requires-python = ">=3.11"
 dependencies = [
     # Pinned to specific versions to mitigate supply-chain risk.
@@ -40,7 +40,12 @@ select = ["E", "F", "W", "I", "UP", "B", "S"]
 ignore = ["S101", "S603", "S607"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+"tests/*" = ["S101", "S105", "S106"]
+# gmx_reader.py uses ERC20 token addresses as keys / sentinels — ruff
+# misidentifies them as "hardcoded passwords" because the kwargs end in
+# `_token`. Suppress S105/S106 for this module; the addresses are public
+# on-chain identifiers.
+"src/gmx_strategies/gmx_reader.py" = ["S105", "S106"]
 
 [tool.mypy]
 python_version = "3.11"
