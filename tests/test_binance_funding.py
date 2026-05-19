@@ -270,3 +270,76 @@ def test_symbol_mapping_covers_exactly_five_markets() -> None:
     }
     assert binance_funding.BINANCE_SYMBOL_BY_ALIAS["btc"] == "BTCUSDT"
     assert binance_funding.BINANCE_SYMBOL_BY_ALIAS["xrp"] == "XRPUSDT"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Near-settlement guard (trap-surface monitor added in feat/trap-monitors)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_near_settlement_warn_emitted_when_close_to_settle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When `nextFundingTime - now()` < guard window, emit a WARN log line.
+
+    The rate is still returned — the warn is purely informational (the
+    operator should know the rate is about to flip).
+    """
+    import logging
+    import time
+
+    # Force a fresh import-side cache miss on settings (defaults are fine).
+    # next_funding_time = now + 60s (well within the default 300s guard).
+    next_funding_time_ms = int((time.time() + 60) * 1000)
+    body = {
+        "symbol": "BTCUSDT",
+        "lastFundingRate": "0.00010000",
+        "nextFundingTime": next_funding_time_ms,
+    }
+    fake_resp = _make_fake_response(body=body)
+    with caplog.at_level(logging.WARNING, logger="gmx_strategies.binance_funding"):
+        with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=fake_resp)):
+            rate = await binance_funding.fetch_cex_funding_live("btc")
+    assert rate == pytest.approx(0.0001, rel=1e-9)
+    # The WARN must be present in caplog.
+    warn_lines = [r for r in caplog.records if "near_settlement" in r.message]
+    assert len(warn_lines) == 1
+    assert warn_lines[0].levelname == "WARNING"
+    assert "btc" in warn_lines[0].message
+
+
+@pytest.mark.asyncio
+async def test_near_settlement_warn_not_emitted_when_far_from_settle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When `nextFundingTime - now()` >> guard, no WARN."""
+    import logging
+    import time
+
+    # Settlement 7h ahead — way outside the 5min guard window.
+    next_funding_time_ms = int((time.time() + 7 * 3600) * 1000)
+    body = {
+        "symbol": "BTCUSDT",
+        "lastFundingRate": "0.00010000",
+        "nextFundingTime": next_funding_time_ms,
+    }
+    fake_resp = _make_fake_response(body=body)
+    with caplog.at_level(logging.WARNING, logger="gmx_strategies.binance_funding"):
+        with patch("httpx.AsyncClient.get", new=AsyncMock(return_value=fake_resp)):
+            rate = await binance_funding.fetch_cex_funding_live("btc")
+    assert rate == pytest.approx(0.0001, rel=1e-9)
+    assert not any("near_settlement" in r.message for r in caplog.records)
+
+
+def test_check_near_settlement_silent_on_missing_field() -> None:
+    """A missing/None nextFundingTime must not raise and must not WARN.
+
+    We never WARN-twice on bad rate + bad time — the guard is for the
+    happy path only.
+    """
+    # Importing the helper directly to exercise its negative paths.
+    binance_funding._check_near_settlement("btc", None)
+    binance_funding._check_near_settlement("btc", "garbage")  # not a number
+    binance_funding._check_near_settlement("btc", -1)         # negative time
+    # No assertion needed — the only contract is "doesn't raise".

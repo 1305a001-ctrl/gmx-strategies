@@ -579,7 +579,14 @@ async def fetch_gmx_funding_live(  # noqa: PLR0911
         if info is None:
             return None
         if info["is_disabled"]:
-            log.warning("gmx_reader.market_disabled market=%s", market)
+            # Trap-surface WARN: market is governance-disabled. Loop already
+            # handles this gracefully (None propagates to the per-market
+            # try/except and the sweep continues) but the operator needs to
+            # see this in stderr — silent delisting was the wsteth bug.
+            log.warning(
+                "gmx_reader.market_disabled market=%s — market is disabled, returning None",
+                market,
+            )
             return None
 
         # Step 4: read long-side and short-side OI in USD. GMX V2 stores OI

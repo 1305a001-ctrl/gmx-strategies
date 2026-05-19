@@ -127,6 +127,43 @@ pip install -e '.[dev]'
 pytest -q
 ```
 
+## Watchdog deploy (ai-primary)
+
+The package ships a `python -m gmx_strategies.cli watchdog` subcommand that
+runs trap-surface drift checks on the live external dependencies — read-only,
+no order placement, no state mutation. See `src/gmx_strategies/watchdog.py`
+for the full check list and severity definitions.
+
+Checks today:
+- **GMX V2 Reader address** vs `gmx-io/gmx-synthetics/deployments/arbitrum/Reader.json` on GitHub. Drift → CRITICAL (operator action: update `gmx_reader_address_arbitrum`).
+- **GMX markets alive** — each entry in `ARBITRUM_MARKETS` against `Reader.getMarket`. Zero-struct (delist) → WARN.
+- **HyperLend WHYPE oracle source** — `IAaveOracle.getSourceOfAsset(WHYPE)` vs the expected RedStone feed. Drift → CRITICAL.
+
+Cron entry (every 30 minutes, alerts to `trap_alerts:gmx` Redis stream):
+
+```
+# Every 30 minutes — checks Reader/markets/HyperLend source, alerts to Redis on drift
+*/30 * * * * /usr/bin/docker exec gmx-strategies python -m gmx_strategies.cli watchdog --emit-alerts >> /var/log/gmx-watchdog.log 2>&1
+```
+
+Exit codes: 0 = clean / WARN-only, 2 = CRITICAL drift, 3 = the watchdog itself
+could not reach a source (treat as "no signal" — don't conclude no-drift).
+
+Consume alerts:
+
+```bash
+# Tail new drift alerts since the last read (operator session)
+redis-cli XREAD COUNT 100 STREAMS trap_alerts:gmx '$'
+# Or replay the last 50
+redis-cli XREVRANGE trap_alerts:gmx + - COUNT 50
+```
+
+Manual one-shot (no Redis publish, human-readable):
+
+```bash
+docker exec gmx-strategies python -m gmx_strategies.cli watchdog
+```
+
 ## Hard gates
 
 - LIVE_ENABLED defaults False
