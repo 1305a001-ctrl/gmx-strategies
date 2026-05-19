@@ -17,13 +17,21 @@ class Settings(BaseSettings):
 
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
-    monitored_markets: str = "btc,eth,sol,wsteth"
+    # 5 Arbitrum perp markets that overlap our 7 live Streams feeds.
+    # BNB + HYPE feeds excluded — no GMX V2 market for either.
+    monitored_markets: str = "btc,eth,sol,doge,xrp"
 
     # --- Funding rate arb (delta-neutral) ---
     # Min absolute funding rate (per 8 hours, fraction) to consider opening.
     funding_arb_min_rate: float = 0.0005  # 0.05%/8hr ~ 5.5%/yr
     funding_arb_max_position_usd: float = 50_000.0
     funding_arb_hedge_venue: str = "binance"  # spot hedge
+    # Runtime loop cadence (seconds between full sweeps of monitored markets).
+    funding_arb_poll_interval_s: int = 60
+    # Pub/sub channel + stream for paper-mode signal emit.
+    funding_arb_signals_channel: str = "funding_arb:signals"
+    funding_arb_eval_log_stream: str = "funding_arb:eval_log"
+    funding_arb_eval_log_maxlen: int = 1_000_000
 
     # --- Eval log streams ---
     paper_log_stream: str = "gmx:eval_log"
