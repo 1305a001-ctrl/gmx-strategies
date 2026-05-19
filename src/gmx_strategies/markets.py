@@ -84,6 +84,24 @@ ARBITRUM_MARKETS: dict[str, GMXMarket] = {
         long_collateral_token=_ARB_WSTETH,
         short_collateral_token=_ARB_USDC,
     ),
+    # DOGE + XRP are synthetic-index markets on GMX V2 Arbitrum — no native
+    # ERC20 for the index. Long/short collateral is WETH/USDC per
+    # synthetics config (gmx-io/gmx-interface sdk/src/configs/markets.ts).
+    # Verified deployed via eth_getCode on Arbitrum mainnet 2026-05-20.
+    "doge": GMXMarket(
+        alias="doge",
+        chain="arbitrum",
+        market_address="0x6853EA96FF216fAb11D2d930CE3C508556A4bdc4",
+        long_collateral_token=_ARB_WETH,
+        short_collateral_token=_ARB_USDC,
+    ),
+    "xrp": GMXMarket(
+        alias="xrp",
+        chain="arbitrum",
+        market_address="0x0CCB4fAa6f1F1B30911619f1184082aB4E25813c",
+        long_collateral_token=_ARB_WETH,
+        short_collateral_token=_ARB_USDC,
+    ),
 }
 
 
