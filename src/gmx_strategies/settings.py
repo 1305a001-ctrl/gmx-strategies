@@ -39,6 +39,28 @@ class Settings(BaseSettings):
     # confirm. DataStore has been stable since GMX V2 launch.
     gmx_reader_address_arbitrum: str = "0x470fbC46bcC0f16532691Df360A07d8Bf5ee0789"
     gmx_datastore_address_arbitrum: str = "0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8"
+    # ExchangeRouter (Arbitrum) — verified 2026-05-20 against
+    # gmx-io/gmx-synthetics/deployments/arbitrum/ExchangeRouter.json.
+    # Entry point for all order ops. Send `multicall(sendWnt + sendTokens
+    # + createOrder)` calldata HERE. NOT the ERC20 approval target — see
+    # `gmx_router_proxy_address_arbitrum` below (audit C1).
+    gmx_exchange_router_address_arbitrum: str = (
+        "0x1C3fa76e6E1088bCE750f23a5BFcffa1efEF6A41"
+    )
+    # Router proxy (Arbitrum) — verified 2026-05-20. CRITICAL: this is the
+    # ERC20 `approve()` target, NOT ExchangeRouter. Router holds the
+    # `ROUTER_PLUGIN` role; ExchangeRouter calls `Router.pluginTransfer`
+    # to pull collateral. Approving ExchangeRouter directly leaves
+    # `pluginTransfer` reverting with onlyRouterPlugin. Audit C1.
+    gmx_router_proxy_address_arbitrum: str = (
+        "0x7452c558d45f8afC8c83dAe62C3f8A5BE19c71f6"
+    )
+    # OrderVault (Arbitrum) — verified 2026-05-20. Destination of both
+    # `sendWnt` (executionFee in WETH) and `sendTokens` (collateral). The
+    # `createOrder` call drains it in the same multicall.
+    gmx_order_vault_address_arbitrum: str = (
+        "0x31eF83a530Fde1B38EE9A18093A333D8Bbbc40D5"
+    )
     # GMX V2 uses 30-decimal fixed-point for fundingFactorPerSecond /
     # borrowingFactorPerSecond / OI USD values. Convert with
     # `rate_per_8h = factor_per_second * 8 * 3600 / 10**30`.
@@ -46,6 +68,18 @@ class Settings(BaseSettings):
     # Reader/DataStore RPC timeout (seconds). Public Arbitrum RPC is ~200-500ms
     # for view calls; 5s leaves wide head-room. Override for slow back-ends.
     gmx_reader_timeout_s: float = 5.0
+    # `acceptablePrice` slippage band in basis points. v2.2's pending-impact
+    # mechanism tightens the band relative to v2.0/v2.1 — set wider than
+    # historical defaults to avoid orders cancelling on every fill.
+    # Per audit Q5+H2: 1-2% on majors (btc/eth), 3-5% on alts (sol/doge/xrp).
+    gmx_default_acceptable_price_band_majors_bps: int = 150  # 1.5%
+    gmx_default_acceptable_price_band_alts_bps: int = 350  # 3.5%
+    # Gas limits for order execution — verified 2026-05-20 @ Arbitrum block
+    # 464561127. DataStore keys `INCREASE_ORDER_GAS_LIMIT` and
+    # `DECREASE_ORDER_GAS_LIMIT` both = 3,000,000. Used to right-size
+    # executionFee = gas_limit * gas_price * headroom.
+    gmx_increase_order_gas_limit: int = 3_000_000
+    gmx_decrease_order_gas_limit: int = 3_000_000
     # Which funding fetcher the runtime uses: "mock" (paper stub from
     # funding_arb_runtime.py) or "live" (gmx_reader.fetch_gmx_funding_live).
     # Defaults to "mock" — LIVE_ENABLED gate untouched, but signals stay
