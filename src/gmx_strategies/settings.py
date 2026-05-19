@@ -15,6 +15,27 @@ class Settings(BaseSettings):
     arbitrum_rpc_url: str = "https://arb1.arbitrum.io/rpc"
     avalanche_rpc_url: str = "https://api.avax.network/ext/bc/C/rpc"
 
+    # --- GMX V2 Reader (G2 live integration) ---
+    # Verified 2026-05-20 against gmx-io/gmx-synthetics/deployments/arbitrum/.
+    # GMX has redeployed Reader at least once during this project's life
+    # (see memory/arch_gmx_v2_audit.md addendum 2026-05-20). Re-pull
+    # `deployments/arbitrum/Reader.json` at each integration milestone to
+    # confirm. DataStore has been stable since GMX V2 launch.
+    gmx_reader_address_arbitrum: str = "0x470fbC46bcC0f16532691Df360A07d8Bf5ee0789"
+    gmx_datastore_address_arbitrum: str = "0xFD70de6b91282D8017aA4E741e9Ae325CAb992d8"
+    # GMX V2 uses 30-decimal fixed-point for fundingFactorPerSecond /
+    # borrowingFactorPerSecond / OI USD values. Convert with
+    # `rate_per_8h = factor_per_second * 8 * 3600 / 10**30`.
+    gmx_funding_factor_scale: int = 30
+    # Reader/DataStore RPC timeout (seconds). Public Arbitrum RPC is ~200-500ms
+    # for view calls; 5s leaves wide head-room. Override for slow back-ends.
+    gmx_reader_timeout_s: float = 5.0
+    # Which funding fetcher the runtime uses: "mock" (paper stub from
+    # funding_arb_runtime.py) or "live" (gmx_reader.fetch_gmx_funding_live).
+    # Defaults to "mock" — LIVE_ENABLED gate untouched, but signals stay
+    # synthetic until the operator explicitly opts in.
+    gmx_funding_source: str = "mock"
+
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
     # 5 Arbitrum perp markets that overlap our 7 live Streams feeds.
