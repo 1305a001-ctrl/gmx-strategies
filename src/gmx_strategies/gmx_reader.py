@@ -212,31 +212,56 @@ def _scale_price_to_gmx(price_usd: float, token_decimals: int) -> int:
     return int(scaled)
 
 
+# Stablecoin fallback prices — used when chainlink:<alias>:latest is missing
+# (e.g., operator's Streams entitlement covers 7 risk assets but not the
+# stablecoin collateral side of GMX V2 markets). USDC has been within ±20bps
+# of $1.00 for >99% of its lifetime; using a $1.00 constant for MarketPrices
+# construction introduces at most ~0.2% USD-side error in OI scaling — fine
+# for funding-arb signal generation. If higher precision is needed later,
+# wire pyth:<alias>:latest as a secondary source (OCDE republishes Pyth USDC).
+_STABLECOIN_FALLBACK_USD: dict[str, float] = {
+    "usdc": 1.0,
+    "usdt": 1.0,
+    "dai": 1.0,
+    "fdusd": 1.0,
+}
+
+
 async def _get_streams_price(alias: str, redis: Any) -> float | None:
     """Read `benchmark_price_float64` from `chainlink:{alias}:latest`.
 
     Returns None when the key is missing, the JSON malformed, or the
-    field absent. The Redis client used is the package's shared async
-    client (decode_responses=True so we get strings, not bytes).
+    field absent — EXCEPT for known stablecoins (USDC/USDT/DAI/FDUSD),
+    which fall back to $1.00 USD via `_STABLECOIN_FALLBACK_USD`. Rationale:
+    the operator's 7-feed Streams entitlement covers risk assets only,
+    not stablecoins, and constructing MarketPrices for any GMX V2 market
+    requires a price for the short-collateral stablecoin.
+
+    The Redis client used is the package's shared async client
+    (decode_responses=True so we get strings, not bytes).
     """
     key = f"chainlink:{alias}:latest"
     try:
         raw = await redis.get(key)
     except Exception as exc:  # noqa: BLE001
         log.warning("gmx_reader.streams_get_failed key=%s err=%s", key, exc)
-        return None
+        return _STABLECOIN_FALLBACK_USD.get(alias.lower())
     if raw is None:
+        fb = _STABLECOIN_FALLBACK_USD.get(alias.lower())
+        if fb is not None:
+            log.debug("gmx_reader.streams_missing_stable_fallback key=%s fallback=%s", key, fb)
+            return fb
         log.warning("gmx_reader.streams_missing key=%s", key)
         return None
     try:
         payload = json.loads(raw)
     except (ValueError, TypeError):
         log.warning("gmx_reader.streams_bad_json key=%s", key)
-        return None
+        return _STABLECOIN_FALLBACK_USD.get(alias.lower())
     price = payload.get("benchmark_price_float64")
     if not isinstance(price, (int, float)) or price <= 0:
         log.warning("gmx_reader.streams_bad_price key=%s value=%r", key, price)
-        return None
+        return _STABLECOIN_FALLBACK_USD.get(alias.lower())
     return float(price)
 
 
