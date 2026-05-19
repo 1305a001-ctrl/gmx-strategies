@@ -36,6 +36,22 @@ class Settings(BaseSettings):
     # synthetic until the operator explicitly opts in.
     gmx_funding_source: str = "mock"
 
+    # --- Binance perp funding (G3 — CEX hedge leg) ---
+    # Source for the CEX-side funding rate. "mock" (default) returns 0.0
+    # via the legacy stub in funding_arb_runtime.py — keeps net_rate == gmx_rate.
+    # "live" hits Binance's public /fapi/v1/premiumIndex endpoint.
+    binance_funding_source: str = "mock"  # "mock" | "live"
+    # Base URL — override to binance.us or a region-blocked alternative if needed.
+    binance_fapi_base_url: str = "https://fapi.binance.com"
+    # HTTP timeout (seconds). Binance fapi responds in ~50-200ms typically;
+    # 5s leaves wide head-room and matches gmx_reader_timeout_s.
+    binance_funding_timeout_s: float = 5.0
+    # When True (default), the runtime uses one batched /premiumIndex call
+    # per sweep (returns ~745 perp markets, we filter to our 5). Much cheaper
+    # at 60s cadence than 5 separate calls. Set False to use per-market calls
+    # (useful for debugging or if Binance starts rate-limiting the no-symbol path).
+    binance_funding_batch: bool = True
+
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
     # 5 Arbitrum perp markets that overlap our 7 live Streams feeds.
