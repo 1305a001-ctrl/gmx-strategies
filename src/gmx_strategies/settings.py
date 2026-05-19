@@ -1,10 +1,26 @@
 """Env-driven settings (v0.2 — funding-arb only)."""
 
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# `secrets_dir` lets pydantic-settings read each field from a file under
+# /srv/secrets/<field_name> (operator's convention) in addition to env +
+# .env. Used for `binance_api_key` / `binance_api_secret` (G6.2). The
+# files are owned by the deploy user, mode 0400; never committed.
+# See README "G6 — Binance auth setup" for provisioning.
+#
+# We only enable the secrets-dir source when the dir actually exists —
+# pydantic-settings emits a UserWarning otherwise (harmless but noisy on
+# dev machines without /srv/secrets, which is most of them).
+_SECRETS_DIR = "/srv/secrets"
+_SECRETS_DIR_OR_NONE: str | None = _SECRETS_DIR if Path(_SECRETS_DIR).is_dir() else None
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", extra="ignore", secrets_dir=_SECRETS_DIR_OR_NONE,
+    )
 
     redis_url: str = "redis://localhost:6379/0"
 
@@ -64,6 +80,24 @@ class Settings(BaseSettings):
     # request) and ensures a stale cache never silently causes -1111 PRECISION
     # or -4164 MIN_NOTIONAL rejects. See `binance_exchange_info.py` (G6.1).
     binance_exchange_info_ttl_s: int = 3600
+
+    # --- Binance Futures HMAC auth (G6.2 — signed-endpoint creds) ---
+    # API key + secret for the operator's Binance Futures account. NEVER
+    # committed. Provisioned via env (BINANCE_API_KEY / BINANCE_API_SECRET)
+    # or via /srv/secrets/binance_api_{key,secret} files (see secrets_dir
+    # above). Both default to empty — the auth module logs a warning and
+    # returns None from every signed call if either is unset. Required
+    # scopes on the key: `enableFutures` + `enableReading` ONLY. NO
+    # `enableWithdrawals`, NO `enableSpotAndMarginTrading`. IP-allowlist
+    # to ai-primary's egress.
+    binance_api_key: str = ""
+    binance_api_secret: str = ""
+    # `recvWindow` (ms) passed on every signed request. Default 5000ms per
+    # Binance docs. Bounds the validation window for request freshness;
+    # lower = stricter clock-drift requirement, higher = wider replay
+    # window. 5000ms is the Binance default and is fine for ai-primary's
+    # <2s clock drift.
+    binance_recv_window_ms: int = 5000
 
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
