@@ -120,6 +120,113 @@ When G2 wires `fetch_gmx_funding` against web3, use these:
 3. Confirm `MarketInfo.isDisabled == false` for each market before emitting signals.
 4. Match the funding-rate scaling against a known mark via the GMX UI to confirm the 30-decimal conversion is correct.
 
+## G6 — Binance auth setup
+
+G6 is the Binance USDT-M Futures executor for the funding-arb hedge leg. G6.1 (PR #15) reads the public `exchangeInfo` endpoint for filter caching. G6.2 (this section) adds HMAC-SHA256 signed-request auth + read-only account state + a position-mode startup gate. G6.3 will add margin-type + leverage POSTs; G6.4 will add order placement.
+
+The audit at `memory/arch_binance_executor_audit.md` is **CONDITIONAL GO** — start against TESTNET only; mainnet capital gated on the Malaysia jurisdiction decision the operator must record separately.
+
+### 1. Create the API key
+
+**On Binance UI (NOT the API — see step 4 below for why)**:
+
+1. Open the Futures account FIRST. The Futures API can't be used by a key that was created before the Futures account was opened.
+2. Account → API Management → Create API.
+3. Name it e.g. `g6-testnet` or `g6-mainnet` so the two never get confused.
+4. Required scopes:
+   - `enableReading` (always granted)
+   - `enableFutures` — **YES**
+   - `enableSpotAndMarginTrading` — **NO** (G6 only touches futures)
+   - `enableWithdrawals` — **NO. EVER.** This is a hard rule, not a default. A G6 key with withdrawals enabled is one bug away from drained custody.
+   - `enableInternalTransfer` — **NO**
+5. IP restriction: **enable** with ai-primary's egress IP added to the allowlist. If your ISP is residential and the IP rotates, defer mainnet until you can pin a static-IP egress (fixed-IP plan, static-IP VPN endpoint, or DigitalOcean tunnel).
+
+**For testnet**: the same flow at `https://demo.binance.com` produces a separate testnet key + secret. Mainnet keys do NOT authenticate against testnet and vice versa.
+
+### 2. Store the creds in /srv/secrets
+
+Two file conventions are supported — pick one per deploy:
+
+**Option A: pydantic-settings secrets-dir (recommended for deploys)**:
+
+```bash
+# On ai-primary, as root:
+sudo install -d -m 0700 -o benadmin -g benadmin /srv/secrets
+echo -n 'your-api-key-here' | sudo tee /srv/secrets/binance_api_key
+echo -n 'your-api-secret-here' | sudo tee /srv/secrets/binance_api_secret
+sudo chown benadmin:benadmin /srv/secrets/binance_api_*
+sudo chmod 0400 /srv/secrets/binance_api_*
+```
+
+`pydantic-settings` reads each file's content as the value for the matching field. `secrets_dir` is conditionally enabled only when `/srv/secrets/` exists — dev machines without the dir won't see warnings.
+
+**Option B: env vars (recommended for local dev / docker)**:
+
+```bash
+export BINANCE_API_KEY='your-api-key-here'
+export BINANCE_API_SECRET='your-api-secret-here'
+# Optional overrides:
+export BINANCE_RECV_WINDOW_MS=5000
+export BINANCE_FAPI_BASE_URL=https://demo-fapi.binance.com  # testnet
+```
+
+NEVER commit. The `binance.env` style file goes under `/srv/secrets/` or stays out of git via `.gitignore`.
+
+### 3. Position mode — operator action required
+
+G6.2 ships `assert_one_way_position_mode()` (`src/gmx_strategies/binance_startup_check.py`). When G6.4 wires it into the executor's startup path, the executor REFUSES to run if your account is in HEDGE mode.
+
+**Why operator-action and not an API-flip in code**: position-mode is an account-wide setting, not per-strategy. If G6 silently flipped it back to one-way every boot, an operator using the same account for a separate hedge-mode experiment would have it stomped on. The intentional UI step is the moat.
+
+**To verify / flip**:
+
+1. Log into Binance Futures UI (mainnet or testnet).
+2. Top-right user icon → Preferences → Position Mode.
+3. Confirm "One-Way Mode" is selected (NOT "Hedge Mode").
+4. If you change it: the flip is only accepted when no positions are open.
+
+If the gate ever raises `BINANCE: account is in HEDGE mode...`, that's the recovery procedure. If it raises `BINANCE: cannot verify position mode — auth issue or API down`, check creds + IP allowlist + clock drift before proceeding.
+
+### 4. Smoke each function manually after env is set
+
+This PR does **NOT** run any smoke against real Binance servers — exposing real credentials to the agent's working environment is unsafe. The operator runs smoke once env is set:
+
+```python
+# python -m asyncio
+import asyncio
+from gmx_strategies import binance_account, binance_startup_check
+
+async def smoke() -> None:
+    # 1. Verify creds reach the API at all.
+    bal = await binance_account.fetch_account_balance()
+    print("balance:", bal[0] if bal else "FAIL — check creds + IP allowlist")
+
+    # 2. Verify USDT free margin pulls.
+    free = await binance_account.fetch_usdt_free_margin()
+    print("usdt_free:", free)
+
+    # 3. Verify position-mode gate.
+    mode = await binance_account.fetch_position_mode()
+    print("hedge?", mode)  # expect False
+    await binance_startup_check.assert_one_way_position_mode()  # should not raise
+    print("startup check: OK")
+
+    # 4. Verify position info reads (likely empty list on a fresh account).
+    pos = await binance_account.fetch_position_information()
+    print("positions:", pos)
+
+asyncio.run(smoke())
+```
+
+Expected outputs at the testnet starting state:
+- `balance`: list of asset dicts with `USDT` entry; `availableBalance` ~ 10000 USDT-T at first registration (Binance grants ~$10k testnet balance; verify by reading the field, don't hardcode).
+- `usdt_free`: float matching `balance[USDT].availableBalance`.
+- `hedge?`: `False` (one-way).
+- `startup check: OK` with no exception.
+- `positions`: `[]` (empty on a fresh account).
+
+Ready to smoke once env is set — see steps 1–3 to provision before running.
+
 ## Tests
 
 ```bash
@@ -172,6 +279,8 @@ docker exec gmx-strategies python -m gmx_strategies.cli watchdog
 - Max 3 concurrent positions until proven
 - Trading wallet keys NEVER in Claude sessions
 - v0.3 runtime is paper-only; no live web3 calls, no live CEX calls
+- Binance API key: `enableFutures` + `enableReading` ONLY. NO withdrawals. EVER. IP-allowlist required.
+- Position mode MUST be one-way (G6.2 `assert_one_way_position_mode` enforces at startup once wired in G6.4).
 
 ## G6 (CEX hedge leg)
 
@@ -204,7 +313,3 @@ Audit had estimated BTCUSDT min_notional ≈ $100; actual on 2026-05-20 is
 $50 (still 5x the $10 cap — BTC remains unusable at the current cap; G6
 must either raise the per-symbol cap or drop BTC from the hedge basket).
 SOL/DOGE/XRP are tradeable at $5 + cap.
-
-**NOT in this PR** (deferred to G6.2+): HMAC signing, order placement,
-position-mode (one-way vs hedge) check, `marginType` / `leverage` POSTs.
-Public endpoint, no auth.
