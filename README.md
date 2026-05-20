@@ -399,3 +399,104 @@ Exit codes:
   RPC has at the time of the post-broadcast probe — typically `null`
   for a few seconds. The operator can re-poll out-of-band via the
   returned `tx_hash`.
+## G6.3 — Testnet shakedown
+
+`python -m gmx_strategies.cli g6_smoke` is the operator-invoked validation
+that the API key / IP allowlist / position-mode / exchange filters /
+funding-rate path all work end-to-end **before** G6.4's order-placement
+work. **Paper-safe** — only read-only signed endpoints + public reads. No
+order placement. No `marginType` / `leverage` POSTs. No
+`change_position_mode`. It is safe to run against mainnet, but the
+default expectation is testnet (`https://demo-fapi.binance.com`).
+
+The smoke runs every read-only G6 surface in one process and reports
+PASS / FAIL / WARN per check with a final exit code. Operators should
+run this FIRST after provisioning a new key — fail-fast before pointing
+G6.4 at the same key.
+
+### Setup creds (testnet)
+
+Generate testnet credentials at `https://testnet.binancefuture.com`
+(Futures testnet) — log in with a GitHub OAuth flow, click the user
+icon → API Key → Generate. Note: testnet creds are separate from
+mainnet creds; the smoke at testnet will NOT authenticate against
+mainnet and vice versa.
+
+On `ai-primary`:
+
+```bash
+ssh ai-primary 'sudo bash -c "
+  echo \"BINANCE_API_KEY=<testnet-key>\" >> /srv/secrets/gmx-strategies.env
+  echo \"BINANCE_API_SECRET=<testnet-secret>\" >> /srv/secrets/gmx-strategies.env
+  echo \"BINANCE_FAPI_BASE_URL=https://demo-fapi.binance.com\" >> /srv/secrets/gmx-strategies.env
+  chmod 600 /srv/secrets/gmx-strategies.env
+"'
+```
+
+(See "G6 — Binance auth setup" above for the `/srv/secrets/binance_api_*`
+files alternative — both are supported.)
+
+### Run the smoke
+
+```bash
+ssh ai-primary 'docker exec gmx-strategies python -m gmx_strategies.cli g6_smoke'
+```
+
+Add `--force-refresh-exchange-info` to bypass the
+`binance_exchange_info` module-level TTL cache (default 3600s) — useful
+if you just bumped a filter value in the Binance UI and want to
+confirm it propagates.
+
+### Sequence of checks
+
+1. **AUTH-1 credentials configured** — verifies `BINANCE_API_KEY` +
+   `BINANCE_API_SECRET` are both non-empty. Failure exits 3 immediately
+   without further calls.
+2. **AUTH-2 base URL configured** — prints `BINANCE_FAPI_BASE_URL`;
+   WARNs (not FAILs) if it looks like mainnet.
+3. **READ-1 position mode (signed)** — calls
+   `binance_account.fetch_position_mode`. PASS only when one-way (audit
+   H3). HEDGE → FAIL with the recovery instruction (Binance UI →
+   Preferences → Position Mode).
+4. **READ-2 account balance (signed)** — calls
+   `binance_account.fetch_account_balance`. PASS when ≥1 asset entry
+   returned; WARNs on empty list (fresh account).
+5. **READ-3 USDT free margin (signed)** — convenience helper. Prints
+   the USDT availableBalance. On testnet, expect ~10000 USDT-T.
+6. **READ-4 position information (signed)** — counts open positions
+   (non-zero `positionAmt`).
+7. **PUBLIC-1 exchange info** — calls
+   `binance_exchange_info.fetch_exchange_info` and verifies all 5 G6
+   markets (BTCUSDT, ETHUSDT, SOLUSDT, DOGEUSDT, XRPUSDT) are present.
+   Prints per-market `min_notional` + `lot_step` so the operator can
+   spot the BTC $50 min vs the $10/trade cap.
+8. **PUBLIC-2 funding rates** — calls
+   `binance_funding.fetch_all_cex_fundings`. Verifies all 5 G6 aliases
+   return a parseable rate; prints per-8h rate + annualized.
+9. **CONSISTENCY-1 position-mode startup gate** — calls
+   `binance_startup_check.assert_one_way_position_mode`. This IS the
+   gate G6.4's boot will call; the smoke runs it last as a final
+   sanity check.
+
+### Exit codes
+
+| Exit | Meaning | Operator action |
+|-----:|---------|-----------------|
+| 0 | Every check passed | Proceed to G6.4 prep |
+| 2 | Functional check failed (hedge mode, missing market, etc.) | Fix the specific check that FAILed |
+| 3 | Credentials not configured | Set `BINANCE_API_KEY` / `BINANCE_API_SECRET` (env or `/srv/secrets/`) |
+| 4 | Every signed read returned None — API unreachable | Debug API key, IP allowlist, base URL, clock drift |
+
+### Secrets hygiene
+
+The smoke NEVER logs the API key or secret. Even on AUTH-1 failure, the
+output is `api_key_set=False api_secret_set=True` rather than the
+values themselves. The exchange-info TTL cache is module-level — if you
+just bumped a filter value in the Binance UI and want to confirm it
+propagates, pass `--force-refresh-exchange-info` to skip the cache.
+
+### Out of scope (G6.4)
+
+This CLI does NOT place orders. The G6.4 PR will add a
+`g6_dry_run_order` subcommand that signs a $5 testnet MARKET order
+end-to-end. Until then, the order-placement surface remains unwired.
