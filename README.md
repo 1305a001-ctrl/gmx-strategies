@@ -399,6 +399,109 @@ Exit codes:
   RPC has at the time of the post-broadcast probe — typically `null`
   for a few seconds. The operator can re-poll out-of-band via the
   returned `tx_hash`.
+
+## G5.3 — Position state reader
+
+`src/gmx_strategies/gmx_position_reader.py` reads on-chain GMX V2 positions
+for any account on Arbitrum. Read-only `eth_call` against the Reader at
+`0x470fbC46…0789`; never writes, never raises.
+
+This is the third piece of the executor stack alongside G5.1 (encoder +
+simulation) and G5.2 (signer + gated submission). Future strategy wiring
+(G7.1+) will call `reconcile_intent` BEFORE every `submit_signed` to detect
+state conflicts on-chain.
+
+### What it reads
+
+- **Bulk:** `fetch_account_positions(account, start=0, end=100)` →
+  `Reader.getAccountPositions(dataStore, account, start, end)`. Returns
+  a list of `Position` dataclasses with size, collateral, side, and the
+  full `Position.Numbers` set. Zero-size positions are filtered out.
+
+- **One-shot:** `fetch_position(account, market_alias, collateral_token,
+  is_long)` → derives the `positionKey =
+  keccak256(abi.encode(account, market, collateralToken, isLong))`
+  client-side, calls `Reader.getPosition(dataStore, key)`. Single RPC
+  hop when the caller already knows the (market, side, collateral) it
+  wants. Returns `None` on zero-struct.
+
+Both return empty/None on any failure (RPC error, transport timeout,
+malformed bytes, revert). Never raise.
+
+### `reconcile_intent` decision matrix
+
+`reconcile_intent(intent, current_positions)` is a pure analysis fn that
+classifies an OrderIntent against live state into one of three actions:
+
+| `intent.is_increase` | existing match | side match | action  | meaning                                |
+|----------------------|----------------|------------|---------|----------------------------------------|
+| True                 | False          | n/a        | PROCEED | safe to open                            |
+| True                 | True           | same       | MERGE   | GMX V2 will auto-merge into existing    |
+| True                 | True           | opposite   | ABORT   | close opposite side first               |
+| False (decrease)     | False          | n/a        | ABORT   | nothing to close                        |
+| False (decrease)     | True           | same       | PROCEED | will close some/all of existing         |
+| False (decrease)     | True           | opposite   | ABORT   | wrong side; check intent.is_long        |
+
+"Match" means same (market, collateral_token) — GMX V2 keys positions by
+`(account, market, collateralToken, isLong)`, so two positions in the
+same market with different collateral tokens are DIFFERENT positions.
+
+A future executor will call this before every submit:
+
+```python
+positions = await fetch_account_positions(executor_address)
+result = reconcile_intent(intent, positions)
+if result.action == "ABORT":
+    log.warning("reconcile abort: %s", result.reason)
+    return
+# else PROCEED or MERGE — proceed; MERGE logs a note that
+# we knowingly added to an existing position.
+```
+
+### Smoke usage
+
+```bash
+# Read positions for the canonical empty address (expects 0 results)
+# plus the operator's account if a key is configured.
+python -m gmx_strategies.cli g5_position_smoke
+```
+
+Exit codes:
+- `0` — both reads succeeded (regardless of position count)
+- `2` — decoder failed on a non-empty/malformed response
+- `3` — RPC unreachable (transport failure on the connectivity probe)
+
+The smoke does NOT require a configured executor key — the canonical
+empty address read is always exercised. If a key IS configured, the
+operator's positions are listed alongside.
+
+### Decode quirk — v2.2 struct shape
+
+`Position.Numbers` in GMX V2 v2.2 (verified against the main branch
+`contracts/position/Position.sol` 2026-05-20):
+
+```solidity
+struct Numbers {
+    uint256 sizeInUsd;
+    uint256 sizeInTokens;
+    uint256 collateralAmount;
+    int256  pendingImpactAmount;   // NEW v2.2
+    uint256 borrowingFactor;
+    uint256 fundingFeeAmountPerSize;
+    uint256 longTokenClaimableFundingAmountPerSize;
+    uint256 shortTokenClaimableFundingAmountPerSize;
+    uint256 increasedAtTime;        // NOTE: v2.2 dropped the AtBlock fields
+    uint256 decreasedAtTime;
+}
+```
+
+Older audit memory mentioned `increasedAtBlock` / `decreasedAtBlock`;
+those fields were removed in v2.2 in favor of timestamps. The
+`Position` dataclass exposes only `increased_at_time` and
+`decreased_at_time` to match what the chain actually returns. Partial-
+liquidation detection still works: `decreased_at_time > increased_at_time
+AND size_in_usd > 0` is the signal.
+
 ## G6.3 — Testnet shakedown
 
 `python -m gmx_strategies.cli g6_smoke` is the operator-invoked validation
