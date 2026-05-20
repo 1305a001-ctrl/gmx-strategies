@@ -82,8 +82,9 @@ class Settings(BaseSettings):
     gmx_decrease_order_gas_limit: int = 3_000_000
     # Which funding fetcher the runtime uses: "mock" (paper stub from
     # funding_arb_runtime.py) or "live" (gmx_reader.fetch_gmx_funding_live).
-    # Defaults to "mock" — LIVE_ENABLED gate untouched, but signals stay
-    # synthetic until the operator explicitly opts in.
+    # Defaults to "mock" — flipping to "live" only makes signals real;
+    # broadcasting to the network requires the separate `live_gmx_enabled`
+    # gate below (see G5.2 section).
     gmx_funding_source: str = "mock"
 
     # --- Binance perp funding (G3 — CEX hedge leg) ---
@@ -155,12 +156,43 @@ class Settings(BaseSettings):
     paper_log_stream: str = "gmx:eval_log"
     paper_log_maxlen: int = 5_000_000
 
-    # --- Live execution gates ---
-    live_enabled: bool = False
-    live_strategies_confirmed: str = ""  # CSV: funding_arb
+    # --- Live execution gates (per-venue, post-G5.2) ---
+    # Each gate defaults False; flipping one does not enable the other.
+    # `live_gmx_enabled` is consumed by gmx_signer.submit_signed.
+    # `live_binance_enabled` is reserved for the future Binance hedge-leg
+    # broadcaster (G6.4). Both remain False until the operator opts in.
+    #
+    # The pre-G5.2 `live_enabled` boolean + `live_strategies_confirmed`
+    # CSV were removed in this PR — they were vestigial (no consumers) and
+    # gave a false impression of a working gate. Per-venue gates are the
+    # canonical mechanism going forward.
+    live_gmx_enabled: bool = False
+    live_binance_enabled: bool = False
 
-    # Wallet — never commit
-    executor_private_key: str = ""
+    # --- GMX V2 signer (G5.2) ---
+    # Path to the file containing the operator's executor private key.
+    # Convention: `chown root:root && chmod 0400` so only the deploy user
+    # can read. The signer module (`gmx_signer.py`) strips whitespace,
+    # rejects empty files, and NEVER logs the contents. Falls back to the
+    # `GMX_EXECUTOR_KEY` env var ONLY for dev convenience — production
+    # deploys MUST use the file.
+    gmx_executor_key_path: str = "/srv/secrets/gmx_executor_key"
+    # Chain id passed into EIP-1559 transactions. 42161 = Arbitrum One.
+    gmx_chain_id_arbitrum: int = 42161
+    # Priority fee (gwei) for EIP-1559 tip. Arbitrum priority fees are
+    # microscopic — 0.01 gwei = 10_000_000 wei is the established norm
+    # for the sequencer-prioritised tier (verified vs `eth_maxPriorityFee`
+    # responses on Arbitrum 2026-05-20).
+    gmx_max_priority_fee_gwei: float = 0.01
+    # Safety margin (percent) added on top of the audit-verified gas
+    # limits before submitting. 20% gives the keeper room when blocks are
+    # full or the order has a slightly heavier impact path than the
+    # baseline gas-estimate assumed.
+    gmx_gas_limit_safety_margin_pct: int = 20
+    # Max seconds to poll for an `eth_getTransactionReceipt` after a
+    # broadcast before bailing with a receiptless SendResult. The hash
+    # is still returned — the operator can re-poll out-of-band.
+    gmx_submit_receipt_timeout_s: int = 60
 
     max_position_usd: float = 5_000.0  # initial cap
     max_concurrent_positions: int = 3
