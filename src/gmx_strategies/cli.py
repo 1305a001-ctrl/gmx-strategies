@@ -1,20 +1,28 @@
 """Small argparse CLI for the gmx-strategies package.
 
 Subcommands:
-  - `watchdog`      — trap-surface drift checks (cron-driven, see below).
-  - `g5_sign_smoke` — G5.2 signer smoke (paper-safe, see below).
+  - `watchdog`      — trap-surface drift checks (cron-driven). See block below.
+  - `g5_sign_smoke` — G5.2 signer smoke (paper-safe; never broadcasts).
+  - `g6_smoke`      — G6.3 Binance Futures testnet/mainnet shakedown.
+                      Operator-invoked one-shot validation of the entire G6
+                      read-side stack (auth, exchangeInfo, funding, position
+                      mode, account balance, position info) against the
+                      configured base URL (typically demo-fapi.binance.com).
 
 `watchdog`:
-  Cron on ai-primary (every ~30 minutes). Runs every check in `watchdog.py`:
+  Cron on ai-primary (every ~30 minutes). Runs every check in `watchdog.py`,
+  prints a one-line per-check summary + final tally, with `--emit-alerts`
+  publishes each non-OK result to the Redis stream
+  `settings.trap_alerts_stream` (default `trap_alerts:gmx`) via XADD
+  with maxlen=`settings.trap_alerts_maxlen` (approximate). Exits non-zero
+  (code 2) iff any CRITICAL drift was found.
 
-  1. Runs every check in `watchdog.py`.
-  2. Prints a one-line per-check summary + final tally to stdout.
-  3. With `--emit-alerts`, publishes each non-OK result to the Redis stream
-     `settings.trap_alerts_stream` (default `trap_alerts:gmx`) via XADD
-     with maxlen=`settings.trap_alerts_maxlen` (approximate).
-  4. Exits non-zero (specifically code 2) iff any CRITICAL drift was found.
-     This lets the operator wire `cron` → `mail` on non-zero exit, or pipe
-     to a healthcheck endpoint.
+`g6_smoke`:
+  Operator-invoked validation that the API key / IP allowlist / position
+  mode / exchange filters / funding-rate path all work end-to-end BEFORE
+  any G6.4 order-placement work. PAPER-SAFE — read-only signed endpoints
+  + public reads. NO order placement. NO `marginType`/`leverage` flips.
+  See `_g6_smoke_main` for the exact check sequence + exit code map.
 
 `g5_sign_smoke`:
   Operator-invoked one-shot validation that the G5.2 signer module can
@@ -27,14 +35,21 @@ Manual invocation:
     python -m gmx_strategies.cli watchdog --emit-alerts
     python -m gmx_strategies.cli watchdog --json
     python -m gmx_strategies.cli g5_sign_smoke
+    python -m gmx_strategies.cli g6_smoke
+    python -m gmx_strategies.cli g6_smoke --force-refresh-exchange-info
 
 Exit codes:
     0 — all checks OK or WARN only / signer smoke acceptable
     1 — CLI usage / argument error (argparse default)
-    2 — at least one CRITICAL drift found / smoke had a critical-fail revert
-    3 — at least one ERROR (watchdog itself couldn't reach a source) OR
-        signer smoke could not load the executor key; the operator should
-        investigate before trusting "no drift" / before retrying the smoke
+    2 — watchdog: at least one CRITICAL drift found;
+        g5_sign_smoke: critical-fail revert;
+        g6_smoke: at least one functional check failed (hedge mode, missing
+        market filter, etc.)
+    3 — watchdog: at least one ERROR (watchdog itself couldn't reach a source);
+        g5_sign_smoke: could not load the executor key;
+        g6_smoke: credentials not configured (BINANCE_API_KEY/SECRET unset).
+    4 — g6_smoke only: API down / unreachable (every signed read returned
+        None — could be auth failure, IP-allowlist miss, network outage).
 """
 
 from __future__ import annotations
@@ -223,6 +238,313 @@ async def _g5_sign_smoke_main(args: argparse.Namespace) -> int:
         f"acceptable_buckets={sorted(KNOWN_ACCEPTABLE_BUCKETS)}",
     )
     return 2
+# g6_smoke — G6.3 Binance Futures testnet/mainnet shakedown CLI
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The smoke runs each read-only check in order and prints one line per
+# check with a clear pass / fail / warn marker. At the end it tallies and
+# exits with one of:
+#   0 — every check passed
+#   2 — at least one functional check failed (e.g. hedge mode, missing
+#       market, funding-rate parse failed)
+#   3 — credentials not configured (api_key OR api_secret unset)
+#   4 — API down / unreachable (every signed read returned None — could be
+#       wrong base URL, bad IP-allowlist, clock drift, or testnet outage)
+#
+# The expected MARKETS list is the G6 hedge-leg basket. Mirrored from
+# binance_funding.BINANCE_SYMBOL_BY_ALIAS so they stay in lockstep.
+
+# Markers — ASCII so they render in any terminal / log forwarder. Operators
+# scan the column visually; emoji-style markers caused some terminals to
+# misalign and obscured the pass/fail signal in early G5 smoke runs.
+# ruff S105 false-positive: `_PASS = "[PASS]"` is a UI tag, not a password.
+_PASS = "[PASS]"  # noqa: S105
+_FAIL = "[FAIL]"  # noqa: S105
+_WARN = "[WARN]"  # noqa: S105
+
+# The 5 markets G6 cares about, as Binance USDT-M perp symbols. Kept here
+# rather than imported from binance_funding's reverse map because the
+# smoke wants the symbol-set as a fixed expectation: "did exchangeInfo
+# return ALL 5?" The funding module's map is the source of truth; this
+# list is its mirror. If they drift, update both.
+_EXPECTED_MARKETS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT")
+
+
+def _format_check(marker: str, name: str, detail: str) -> str:
+    """Format one check line. Kept private so tests can match exact strings."""
+    return f"{marker} {name}: {detail}"
+
+
+async def _g6_smoke_main(args: argparse.Namespace) -> int:
+    """Run the G6.3 testnet/mainnet smoke and return an exit code.
+
+    Sequence (audit `arch_binance_executor_audit.md`):
+      AUTH-1   credentials configured (settings.binance_api_key/secret)
+      AUTH-2   base URL configured (warn if mainnet)
+      READ-1   position mode (signed) — must be one-way
+      READ-2   account balance (signed)
+      READ-3   USDT free margin (signed) — should be ~10000 USDT-T on testnet
+      READ-4   position information (signed)
+      PUBLIC-1 exchange info — verify all 5 G6 markets present
+      PUBLIC-2 funding rates — verify all 5 markets return a parseable rate
+      CONSISTENCY-1 position-mode startup gate (assert_one_way_position_mode)
+
+    No order placement. No state-changing calls. Read-only.
+    """
+    # Import the read modules lazily so the CLI `--help` path stays cheap;
+    # `settings` is already loaded at module import for both subcommands.
+    from gmx_strategies import (
+        binance_account,
+        binance_exchange_info,
+        binance_funding,
+        binance_startup_check,
+    )
+
+    # Track each check's outcome. Aggregated at the end for the summary
+    # line + exit-code computation. Counts mirror the watchdog summary
+    # format so an operator who knows one knows the other.
+    n_pass = 0
+    n_fail = 0
+    n_warn = 0
+    # Track signed-read failures separately. If EVERY signed read returns
+    # None we exit 4 (API down) rather than 2 (functional fail) — the
+    # operator's first action is different (debug network/IP vs. fix
+    # account config).
+    signed_total = 0
+    signed_none = 0
+
+    print("G6.3 Binance Futures smoke — read-only validation")
+    print(f"  base_url: {settings.binance_fapi_base_url}")
+    print(f"  recv_window_ms: {settings.binance_recv_window_ms}")
+    print()
+
+    # ── AUTH-1: credentials configured ──────────────────────────────────
+    # Done BEFORE any HTTP call. If the key/secret is unset every signed
+    # call returns None — but the operator's recovery is "go set the
+    # creds", not "debug the network". Distinguish the two upfront.
+    api_key_set = bool(settings.binance_api_key)
+    api_secret_set = bool(settings.binance_api_secret)
+    if api_key_set and api_secret_set:
+        print(_format_check(_PASS, "AUTH-1 credentials configured",
+                            "api_key + api_secret both set"))
+        n_pass += 1
+    else:
+        print(_format_check(_FAIL, "AUTH-1 credentials configured",
+                            f"api_key_set={api_key_set} api_secret_set={api_secret_set} "
+                            "— set BINANCE_API_KEY / BINANCE_API_SECRET env or "
+                            "/srv/secrets/binance_api_{key,secret} files"))
+        n_fail += 1
+        # Early-out: nothing else works without creds. Print a summary
+        # and exit 3 so operators don't wade through 8 redundant FAILs.
+        print()
+        print(f"summary: PASS={n_pass} FAIL={n_fail} WARN={n_warn}")
+        print("exit_code: 3 (credentials not configured)")
+        return 3
+
+    # ── AUTH-2: base URL configured ─────────────────────────────────────
+    # Mainnet is a footgun for a SHAKEDOWN run — the audit's
+    # CONDITIONAL GO requires testnet validation first. We warn but
+    # don't fail; operators do occasionally use this as a mainnet
+    # connectivity check.
+    base = settings.binance_fapi_base_url
+    if "demo" in base or "testnet" in base:
+        print(_format_check(_PASS, "AUTH-2 base URL configured",
+                            f"testnet detected ({base})"))
+        n_pass += 1
+    else:
+        print(_format_check(_WARN, "AUTH-2 base URL configured",
+                            f"mainnet detected ({base}) — testnet recommended "
+                            "for first shakedown"))
+        n_warn += 1
+
+    # ── READ-1: position mode (signed) ──────────────────────────────────
+    # The audit's H3 finding. Must be one-way; hedge mode rejects every
+    # order with -4061. None means the auth path itself didn't return —
+    # the operator needs to debug creds, IP allowlist, or clock drift.
+    signed_total += 1
+    mode = await binance_account.fetch_position_mode()
+    if mode is False:
+        print(_format_check(_PASS, "READ-1 position mode (signed)",
+                            "one-way (dualSidePosition=false)"))
+        n_pass += 1
+    elif mode is True:
+        print(_format_check(_FAIL, "READ-1 position mode (signed)",
+                            "HEDGE mode detected — flip to one-way in Binance "
+                            "UI (Preferences → Position Mode) before G6.4"))
+        n_fail += 1
+    else:
+        # mode is None → auth/network failure path
+        print(_format_check(_FAIL, "READ-1 position mode (signed)",
+                            "signed read returned None — check API key, IP "
+                            "allowlist, base URL, clock drift"))
+        n_fail += 1
+        signed_none += 1
+
+    # ── READ-2: account balance (signed) ────────────────────────────────
+    # Returns a list of per-asset dicts. We only print the USDT one to
+    # avoid spamming a 20+ line output with stablecoins the operator
+    # doesn't care about.
+    signed_total += 1
+    balances = await binance_account.fetch_account_balance()
+    if balances is None:
+        print(_format_check(_FAIL, "READ-2 account balance (signed)",
+                            "signed read returned None"))
+        n_fail += 1
+        signed_none += 1
+    elif isinstance(balances, list) and len(balances) > 0:
+        usdt_summary = "no USDT entry"
+        for entry in balances:
+            if isinstance(entry, dict) and entry.get("asset") == "USDT":
+                bal = entry.get("balance", "?")
+                avail = entry.get("availableBalance", "?")
+                usdt_summary = f"USDT balance={bal} available={avail}"
+                break
+        print(_format_check(_PASS, "READ-2 account balance (signed)",
+                            f"n_assets={len(balances)} {usdt_summary}"))
+        n_pass += 1
+    else:
+        # Empty list — odd but not a hard fail; the account has no asset
+        # balances which is possible on a fresh testnet account that's
+        # never deposited.
+        print(_format_check(_WARN, "READ-2 account balance (signed)",
+                            "empty balance list — fresh account?"))
+        n_warn += 1
+
+    # ── READ-3: USDT free margin (signed) ───────────────────────────────
+    # Convenience helper that float-coerces the USDT availableBalance. On
+    # testnet a freshly-issued key typically returns ~10000 USDT-T.
+    signed_total += 1
+    free_margin = await binance_account.fetch_usdt_free_margin()
+    if free_margin is None:
+        print(_format_check(_FAIL, "READ-3 USDT free margin (signed)",
+                            "returned None — no USDT entry or parse failure"))
+        n_fail += 1
+        signed_none += 1
+    else:
+        print(_format_check(_PASS, "READ-3 USDT free margin (signed)",
+                            f"available={free_margin:.4f} USDT"))
+        n_pass += 1
+
+    # ── READ-4: position information (signed) ───────────────────────────
+    # Returns a list of all position entries. We count non-zero ones to
+    # let the operator confirm whether the testnet sandbox is empty (the
+    # expected state for a fresh shakedown) or has leftover positions
+    # from a prior experiment.
+    signed_total += 1
+    positions = await binance_account.fetch_position_information()
+    if positions is None:
+        print(_format_check(_FAIL, "READ-4 position information (signed)",
+                            "signed read returned None"))
+        n_fail += 1
+        signed_none += 1
+    else:
+        n_open = 0
+        for entry in positions:
+            if not isinstance(entry, dict):
+                continue
+            amt_raw = entry.get("positionAmt", "0")
+            try:
+                amt = float(amt_raw)
+            except (ValueError, TypeError):
+                continue
+            if amt != 0.0:
+                n_open += 1
+        print(_format_check(_PASS, "READ-4 position information (signed)",
+                            f"n_entries={len(positions)} n_open={n_open}"))
+        n_pass += 1
+
+    # ── PUBLIC-1: exchange info ─────────────────────────────────────────
+    # G6.1's reader. Verify all 5 markets we care about parse correctly.
+    # We use fetch_exchange_info (bypassing the TTL cache) so the smoke
+    # always reflects the LIVE state, not whatever a prior process
+    # warmed. Force-refresh flag is offered as a no-op alias for symmetry
+    # with the cached path — see CLI help text.
+    if args.force_refresh_exchange_info:
+        binance_exchange_info._reset_cache_for_testing()  # noqa: SLF001
+    info = await binance_exchange_info.fetch_exchange_info()
+    if not info:
+        print(_format_check(_FAIL, "PUBLIC-1 exchange info",
+                            "empty dict — public endpoint outage or "
+                            "wrong base URL"))
+        n_fail += 1
+    else:
+        missing = [m for m in _EXPECTED_MARKETS if m not in info]
+        if missing:
+            print(_format_check(_FAIL, "PUBLIC-1 exchange info",
+                                f"missing markets: {','.join(missing)} "
+                                f"(got {len(info)} total)"))
+            n_fail += 1
+        else:
+            # Print each target market's min_notional + lot_step so the
+            # operator can spot the BTC $50 min vs the $10/trade cap
+            # without having to grep separately.
+            print(_format_check(_PASS, "PUBLIC-1 exchange info",
+                                f"{len(info)} symbols, all 5 G6 markets present"))
+            for sym in _EXPECTED_MARKETS:
+                s = info[sym]
+                print(f"        {sym}: lot_step={s.lot_step} "
+                      f"lot_min={s.lot_min} min_notional=${s.min_notional}")
+            n_pass += 1
+
+    # ── PUBLIC-2: funding rates ─────────────────────────────────────────
+    # G3's reader. Batched call; we expect all 5 aliases back.
+    fundings = await binance_funding.fetch_all_cex_fundings()
+    if not fundings:
+        print(_format_check(_FAIL, "PUBLIC-2 funding rates",
+                            "empty dict — public endpoint outage or wrong "
+                            "base URL"))
+        n_fail += 1
+    else:
+        expected_aliases = list(binance_funding.BINANCE_SYMBOL_BY_ALIAS.keys())
+        missing_aliases = [a for a in expected_aliases if a not in fundings]
+        if missing_aliases:
+            print(_format_check(_FAIL, "PUBLIC-2 funding rates",
+                                f"missing rates: {','.join(missing_aliases)}"))
+            n_fail += 1
+        else:
+            print(_format_check(_PASS, "PUBLIC-2 funding rates",
+                                f"{len(fundings)} rates parsed"))
+            for alias in expected_aliases:
+                rate = fundings[alias]
+                # Show per-8h fraction + the annualized equivalent so the
+                # operator can sanity-check the magnitude at a glance.
+                ann_pct = rate * 3 * 365 * 100
+                print(f"        {alias}: {rate:+.6f}/8h ({ann_pct:+.2f}%/yr)")
+            n_pass += 1
+
+    # ── CONSISTENCY-1: position-mode startup gate ───────────────────────
+    # binance_startup_check.assert_one_way_position_mode IS the gate that
+    # G6.4's executor boot will call. Smoke runs it as the LAST step so
+    # if it raises (hedge or unknown), the operator has already seen the
+    # earlier READ-1 result and the gate's exception is just a confirmation.
+    try:
+        await binance_startup_check.assert_one_way_position_mode()
+        print(_format_check(_PASS, "CONSISTENCY-1 position-mode gate",
+                            "assert_one_way_position_mode() passed"))
+        n_pass += 1
+    except RuntimeError as exc:
+        # Don't include the api key/secret in the log even on failure —
+        # the exception message itself is safe (no secrets), but we
+        # explicitly defend the boundary.
+        print(_format_check(_FAIL, "CONSISTENCY-1 position-mode gate",
+                            f"raised RuntimeError: {exc}"))
+        n_fail += 1
+
+    # ── Summary + exit code ─────────────────────────────────────────────
+    print()
+    print(f"summary: PASS={n_pass} FAIL={n_fail} WARN={n_warn}")
+
+    # Distinguish "API totally down" from "API works but some checks
+    # fail". If every signed read came back None, the auth/network path
+    # itself is broken — operator should debug creds + IP + clock first.
+    if signed_total > 0 and signed_none == signed_total:
+        print("exit_code: 4 (every signed read returned None — API unreachable)")
+        return 4
+    if n_fail > 0:
+        print(f"exit_code: 2 ({n_fail} functional check(s) failed)")
+        return 2
+    print("exit_code: 0 (all checks passed)")
+    return 0
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -257,6 +579,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "dry-run-simulate via eth_call. Never broadcasts."
         ),
     )
+
+    smoke = sub.add_parser(
+        "g6_smoke",
+        help=(
+            "G6.3 testnet/mainnet shakedown. Runs every read-only Binance "
+            "Futures check end-to-end. Paper-safe — no order placement."
+        ),
+    )
+    smoke.add_argument(
+        "--force-refresh-exchange-info",
+        action="store_true",
+        help=(
+            "Reset the binance_exchange_info module-level TTL cache before "
+            "running PUBLIC-1. Useful if you just bumped filter values in "
+            "the Binance UI and want to verify they propagate."
+        ),
+    )
     return p
 
 
@@ -272,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_watchdog_main(args))
     if args.subcommand == "g5_sign_smoke":
         return asyncio.run(_g5_sign_smoke_main(args))
+    if args.subcommand == "g6_smoke":
+        return asyncio.run(_g6_smoke_main(args))
     parser.print_help()
     return 1
 
