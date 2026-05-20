@@ -203,6 +203,31 @@ class Settings(BaseSettings):
     max_position_usd: float = 5_000.0  # initial cap
     max_concurrent_positions: int = 3
 
+    # --- G7.3 Pilot guard (refuse-to-broadcast layer) ---
+    # The pilot guard is the LAST safety belt — every order placement must
+    # pass `PilotGuard.check()` before broadcast. See `pilot_guard.py`.
+    # The module is independent of the per-venue `live_*_enabled` gates;
+    # both must be True AND the guard must allow. The guard's posture is
+    # DEFAULT-DENY — empty `funding_arb_armed_markets_csv` means NOTHING
+    # trades, regardless of `live_gmx_enabled`/`live_binance_enabled`.
+    #
+    # Memory pointers:
+    #   memory/postmortem_2026_05_19_chainlink_lag_unpause.md — operator
+    #     was burned by chainlink_lag bleeding $22 in 1h. Same shape we're
+    #     preventing here.
+    #   memory/plan_scaling_ladder_chainlink.md — discipline mirrored.
+    funding_arb_armed_markets_csv: str = ""
+    funding_arb_pilot_position_cap_usd: float = 10.0
+    funding_arb_pilot_max_concurrent: int = 1
+    funding_arb_pilot_daily_pnl_floor_usd: float = -50.0
+    funding_arb_pilot_loss_cooldown_s: int = 1800
+    # ruff S105 false-positive: these are Redis key names, not passwords.
+    pilot_killswitch_key: str = "funding_arb:killswitch"  # noqa: S105
+    pilot_last_loss_ts_key: str = "funding_arb:last_loss_ts_ms"  # noqa: S105
+    funding_arb_executions_stream_key: str = "funding_arb:executions"  # noqa: S105
+    guard_blocks_stream_key: str = "funding_arb:guard_blocks"  # noqa: S105
+    guard_blocks_maxlen: int = 100_000
+
     # HTTP
     http_host: str = "0.0.0.0"  # noqa: S104
     http_port: int = 8013
