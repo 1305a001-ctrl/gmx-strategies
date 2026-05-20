@@ -227,6 +227,26 @@ class Settings(BaseSettings):
     funding_arb_executions_stream_key: str = "funding_arb:executions"  # noqa: S105
     guard_blocks_stream_key: str = "funding_arb:guard_blocks"  # noqa: S105
     guard_blocks_maxlen: int = 100_000
+    # Cap on the executions stream length (XADD MAXLEN ~). Each entry is
+    # one signal's outcome; at the 60s sweep cadence + 5 markets we expect
+    # ~7k entries/day. 1M leaves >100 days of audit trail.
+    funding_arb_executions_maxlen: int = 1_000_000
+
+    # --- G7.1 Funding-arb consumer (signal → executor wiring) ---
+    # HARD GATE — above the per-venue live_*_enabled flags. Default False
+    # means the consumer is never instantiated; main.py keeps doing what
+    # it does today (paper signal emit only). To enable the consumer the
+    # operator MUST flip this AND restart the process. There is no
+    # in-flight enable: this is read ONCE at startup.
+    funding_arb_consumer_enabled: bool = False
+    # Per-leg dry_run override. When True (default), BOTH legs use the
+    # dry_run path even if live_gmx_enabled / live_binance_enabled are
+    # True. Set False to allow real broadcasts (still gated by the
+    # per-venue live flags + PilotGuard).
+    funding_arb_executor_dry_run: bool = True
+    # Default per-signal sizing. Overridden per signal if the payload
+    # carries `target_position_usd` (which the G2/G3 emitter does set).
+    funding_arb_target_position_usd: float = 10.0
 
     # HTTP
     http_host: str = "0.0.0.0"  # noqa: S104
