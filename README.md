@@ -86,8 +86,10 @@ same oracle stack the rest of the trading stack already depends on.
 ```
 GMX_FUNDING_SOURCE=live python -m gmx_strategies.main
 ```
-LIVE_ENABLED gate untouched — the runtime still emits to `funding_arb:signals`
-in paper mode; G2 just makes the signals reflect real on-chain conditions.
+The per-venue live gates (`live_gmx_enabled` / `live_binance_enabled`)
+are not consulted by the funding-arb runtime — the runtime still emits
+to `funding_arb:signals` in paper mode; G2 just makes the signals
+reflect real on-chain conditions.
 
 **Failure handling.** `fetch_gmx_funding_live` returns `None` on any failure
 (disabled market, missing Streams price, RPC revert, decode failure). The
@@ -273,11 +275,12 @@ docker exec gmx-strategies python -m gmx_strategies.cli watchdog
 
 ## Hard gates
 
-- LIVE_ENABLED defaults False
-- LIVE_STRATEGIES_CONFIRMED required (CSV: funding_arb)
+- `live_gmx_enabled` defaults False (gates GMX broadcasts in `gmx_signer.submit_signed`)
+- `live_binance_enabled` defaults False (gates Binance broadcasts for the future G6.4 hedge-leg path)
+- Both gates are per-venue; flipping one does not enable the other
 - Per-position cap starts at $5k
 - Max 3 concurrent positions until proven
-- Trading wallet keys NEVER in Claude sessions
+- Trading wallet keys NEVER in Claude sessions (loaded from file at `/srv/secrets/gmx_executor_key`, mode 0400, root-owned — see "G5.2 — Signing + submission")
 - v0.3 runtime is paper-only; no live web3 calls, no live CEX calls
 - Binance API key: `enableFutures` + `enableReading` ONLY. NO withdrawals. EVER. IP-allowlist required.
 - Position mode MUST be one-way (G6.2 `assert_one_way_position_mode` enforces at startup once wired in G6.4).
@@ -313,3 +316,86 @@ Audit had estimated BTCUSDT min_notional ≈ $100; actual on 2026-05-20 is
 $50 (still 5x the $10 cap — BTC remains unusable at the current cap; G6
 must either raise the per-symbol cap or drop BTC from the hedge basket).
 SOL/DOGE/XRP are tradeable at $5 + cap.
+
+## G5.2 — Signing + submission
+
+`src/gmx_strategies/gmx_signer.py` layers on top of the G5.1 encoder. It
+loads the operator's private key, signs an EIP-1559 transaction for the
+`PayableMulticall(sendWnt + sendTokens + createOrder)` payload that the
+encoder produces, and either dry-run-simulates it via `eth_call` or
+submits it via `eth_sendRawTransaction` — gated.
+
+**This module ships the capability but does not wire it into any runtime.**
+That belongs to G7.1 (or whichever strategy first proves an EV-positive
+edge worth broadcasting). The funding-arb backtest at
+`memory/research_funding_arb_backtest_30d.md` killed the original thesis
+on all 5 markets, so G5.2 sits as reusable executor infrastructure for a
+future strategy.
+
+### Gate matrix (`submit_signed`)
+
+| `live_gmx_enabled` | `dry_run` | key present | account match | Broadcast? |
+|--------------------|-----------|-------------|---------------|------------|
+| False              | any       | any         | any           | NO (sim)   |
+| True               | True      | any         | any           | NO (sim)   |
+| True               | False     | False       | n/a           | RuntimeErr |
+| True               | False     | True        | False         | NO (sim)   |
+| True               | False     | True        | True          | YES        |
+
+"Account match" = both `signed_tx["from"]` and `intent.account` resolve to
+the EOA derived from the loaded key. Any gate failing → falls back to
+`eth_call` simulation; nothing touches mempool.
+
+### Provisioning the executor key
+
+```bash
+# On ai-primary (or whichever host runs the GMX executor):
+sudo mkdir -p /srv/secrets
+sudo install -m 0400 -o root -g root /dev/null /srv/secrets/gmx_executor_key
+# Then paste the 64-char hex (with or without 0x prefix), one line, no trailing whitespace:
+sudo nano /srv/secrets/gmx_executor_key
+sudo chmod 0400 /srv/secrets/gmx_executor_key
+sudo chown root:root /srv/secrets/gmx_executor_key
+```
+
+**Never commit, never log, never paste into Claude sessions.** The signer
+module reads the file lazily on first use, derives the EOA via
+`eth_account.Account.from_key()`, and exposes only the derived address
+via `get_executor_address()`. The raw key never appears in returned dicts
+or log lines.
+
+For development (e.g. running `g5_sign_smoke` from a dev shell without
+writing to `/srv/secrets`), set `GMX_EXECUTOR_KEY=<hex>` in your env. The
+file always wins precedence over the env var — production deploys MUST
+use the file path.
+
+### g5_sign_smoke CLI
+
+```bash
+# Loads the key, signs a synthetic $10 SOL MarketIncrease, dry-runs via
+# eth_call. NEVER broadcasts (dry_run=True is hard-coded).
+python -m gmx_strategies.cli g5_sign_smoke
+```
+
+Exit codes:
+- `0` — simulation OK (or known-acceptable revert; encoding + multicall
+  shape + market existence are sound)
+- `2` — critical-fail revert (encoding bug indicator; investigate before
+  re-running)
+- `3` — no key configured (see provisioning above)
+
+### Scope (what this PR DOES NOT wire)
+
+- No funding-arb runtime call site flips to live. The runtime stays
+  paper-only until a strategy with proven positive EV asks for it.
+- No risk-watcher integration on the submit path. When G7.1 lands, it
+  will route via the same `submit_signed(dry_run=False)` after
+  risk-watcher's gates clear; the signer does NOT know about strategy-
+  level halts.
+- No retry / nonce-recycle logic. Each call to `sign_order` fetches a
+  fresh nonce from the RPC. Re-submitting a stale signed tx is the
+  caller's job.
+- The single-shot receipt poll in `submit_signed` returns whatever the
+  RPC has at the time of the post-broadcast probe — typically `null`
+  for a few seconds. The operator can re-poll out-of-band via the
+  returned `tx_hash`.

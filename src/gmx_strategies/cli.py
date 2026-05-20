@@ -1,7 +1,11 @@
 """Small argparse CLI for the gmx-strategies package.
 
-Currently the only subcommand is `watchdog`. The CLI is invoked from a cron
-on ai-primary (every ~30 minutes) and:
+Subcommands:
+  - `watchdog`      — trap-surface drift checks (cron-driven, see below).
+  - `g5_sign_smoke` — G5.2 signer smoke (paper-safe, see below).
+
+`watchdog`:
+  Cron on ai-primary (every ~30 minutes). Runs every check in `watchdog.py`:
 
   1. Runs every check in `watchdog.py`.
   2. Prints a one-line per-check summary + final tally to stdout.
@@ -12,17 +16,25 @@ on ai-primary (every ~30 minutes) and:
      This lets the operator wire `cron` → `mail` on non-zero exit, or pipe
      to a healthcheck endpoint.
 
+`g5_sign_smoke`:
+  Operator-invoked one-shot validation that the G5.2 signer module can
+  load the configured private key, derive the EOA address, sign a
+  synthetic $10 SOL MarketIncrease, and dry-run-simulate it via
+  `eth_call`. Never broadcasts (`dry_run=True` is hard-coded).
+
 Manual invocation:
     python -m gmx_strategies.cli watchdog
     python -m gmx_strategies.cli watchdog --emit-alerts
     python -m gmx_strategies.cli watchdog --json
+    python -m gmx_strategies.cli g5_sign_smoke
 
 Exit codes:
-    0 — all checks OK or WARN only
+    0 — all checks OK or WARN only / signer smoke acceptable
     1 — CLI usage / argument error (argparse default)
-    2 — at least one CRITICAL drift found
-    3 — at least one ERROR (watchdog itself couldn't reach a source); the
-        operator should investigate the watchdog before trusting "no drift"
+    2 — at least one CRITICAL drift found / smoke had a critical-fail revert
+    3 — at least one ERROR (watchdog itself couldn't reach a source) OR
+        signer smoke could not load the executor key; the operator should
+        investigate before trusting "no drift" / before retrying the smoke
 """
 
 from __future__ import annotations
@@ -31,10 +43,12 @@ import argparse
 import asyncio
 import logging
 import sys
+from typing import Any
 
 from gmx_strategies.markets import ARBITRUM_MARKETS
 from gmx_strategies.redis_client import close as close_redis
 from gmx_strategies.redis_client import r as redis_client
+from gmx_strategies.settings import settings
 from gmx_strategies.watchdog import (
     WatchdogResult,
     check_hyperlend_oracle_source,
@@ -113,6 +127,104 @@ async def _watchdog_main(args: argparse.Namespace) -> int:
     return 0
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# g5_sign_smoke — operator-invoked G5.2 signer smoke (paper-safe)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _build_smoke_intent_sol_long(account: str) -> Any:
+    """Pure: build a synthetic $10 SOL long MarketIncrease intent.
+
+    Used only by `g5_sign_smoke`. Mirrors the smoke-test pattern from
+    G5.1 — small $10 size, USDC collateral, alt-band slippage tolerance.
+    """
+    from gmx_strategies.gmx_order_encoder import OrderIntent
+    from gmx_strategies.markets import ARBITRUM_MARKETS
+
+    sol_market = ARBITRUM_MARKETS["sol"]
+    return OrderIntent(
+        market="sol",
+        is_long=True,
+        is_increase=True,
+        # USDC is the short collateral for SOL longs in the GMX convention
+        # we use elsewhere; for this paper-safe smoke we use USDC (6 dec).
+        collateral_token=sol_market.short_collateral_token,
+        initial_collateral_delta_amount=10_000_000,  # $10 USDC
+        size_delta_usd=10 * 10**30,                   # $10 GMX-scaled
+        # $150 SOL @ Arbitrum (close to current price; smoke is read-only)
+        current_price_1e30=150 * 10**22,
+        acceptable_price_band_bps=settings.gmx_default_acceptable_price_band_alts_bps,
+        execution_fee_wei=5 * 10**14,                 # 0.0005 ETH
+        account=account,
+    )
+
+
+async def _g5_sign_smoke_main(args: argparse.Namespace) -> int:
+    """Run the G5.2 signer smoke. Returns the appropriate exit code."""
+    # Imported here so the watchdog path doesn't pay the eth-account import
+    # cost on every cron tick.
+    from gmx_strategies import gmx_signer
+    from gmx_strategies.gmx_errors import KNOWN_ACCEPTABLE_BUCKETS, revert_bucket
+
+    # Step 1 — derive EOA from configured key (or fail clearly)
+    address = gmx_signer.get_executor_address()
+    if address is None:
+        print(
+            "ERROR: no executor key configured. Set "
+            "settings.gmx_executor_key_path (default /srv/secrets/gmx_executor_key) "
+            "or the GMX_EXECUTOR_KEY env var.",
+        )
+        return 3
+    print(f"executor_address={address}")
+
+    # Step 2 — build a synthetic $10 SOL MarketIncrease for that address
+    intent = _build_smoke_intent_sol_long(address)
+    print(
+        f"intent: market={intent.market} is_long={intent.is_long} "
+        f"is_increase={intent.is_increase} size_usd=$10",
+    )
+
+    # Step 3 — sign (this hits Arbitrum mainnet for nonce + gasPrice)
+    try:
+        signed = await gmx_signer.sign_order(intent)
+    except RuntimeError as exc:
+        # Should be impossible given Step 1 returned a non-None address —
+        # but if the file vanishes mid-flight, surface it cleanly.
+        print(f"ERROR: sign_order failed: {exc}")
+        return 3
+    print(
+        f"signed.nonce={signed['nonce']} signed.hash={signed['hash']} "
+        f"raw_len={len(signed['raw']) - 2}",
+    )
+
+    # Step 4 — dry-run submit (explicit dry_run=True — never broadcasts)
+    result = await gmx_signer.submit_signed(signed, intent, dry_run=True)
+    if result.dry_run_simulation is None:
+        print("ERROR: dry-run simulation returned no result (transport error?)")
+        return 3
+    sim = result.dry_run_simulation
+    if sim.ok:
+        print("sim: ok=True (encoding + multicall accepted by mainnet)")
+        return 0
+    # Revert path — distinguish acceptable (expected for unfunded dummy)
+    # from critical-fail (encoding bug indicator).
+    if sim.revert_known_acceptable:
+        print(
+            f"sim: ok=False ACCEPTABLE revert reason={sim.revert_reason_name} "
+            f"selector=0x{sim.revert_selector}",
+        )
+        return 0
+    bucket = revert_bucket(sim.revert_selector) if sim.revert_selector else None
+    print(
+        f"sim: ok=False CRITICAL-FAIL revert "
+        f"reason={sim.revert_reason_name or '<unknown>'} "
+        f"selector=0x{sim.revert_selector or '<none>'} "
+        f"bucket={bucket or '<unmapped>'} "
+        f"acceptable_buckets={sorted(KNOWN_ACCEPTABLE_BUCKETS)}",
+    )
+    return 2
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gmx_strategies.cli",
@@ -137,6 +249,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit results as one JSON line instead of a human-readable summary.",
     )
+
+    sub.add_parser(
+        "g5_sign_smoke",
+        help=(
+            "G5.2 signer smoke: load key, sign synthetic $10 SOL order, "
+            "dry-run-simulate via eth_call. Never broadcasts."
+        ),
+    )
     return p
 
 
@@ -150,6 +270,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.subcommand == "watchdog":
         return asyncio.run(_watchdog_main(args))
+    if args.subcommand == "g5_sign_smoke":
+        return asyncio.run(_g5_sign_smoke_main(args))
     parser.print_help()
     return 1
 
