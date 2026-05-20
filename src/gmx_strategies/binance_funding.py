@@ -27,11 +27,19 @@ Two entry points:
 
 Implementation note: this module uses httpx (already pinned at 0.28.1)
 matching the rest of the package's async/httpx style. No new deps.
+
+Trap-surface monitoring (added in feat/trap-monitors):
+  - After parsing the rate, we also inspect `nextFundingTime` (ms since
+    epoch). When `nextFundingTime - now()` is positive and less than
+    `settings.binance_settlement_guard_s * 1000` (default 300_000 = 5min)
+    we emit `binance_funding.near_settlement` at WARN. The signal still
+    emits — the warn just flags that the rate is about to flip.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -56,6 +64,35 @@ BINANCE_SYMBOL_BY_ALIAS: dict[str, str] = {
 # Reverse map for the batched path — `BTCUSDT -> btc` etc. We rebuild this
 # at module-load so any edit to BINANCE_SYMBOL_BY_ALIAS automatically updates.
 _SYMBOL_TO_ALIAS: dict[str, str] = {sym: a for a, sym in BINANCE_SYMBOL_BY_ALIAS.items()}
+
+
+def _check_near_settlement(alias: str, next_funding_time_ms: Any) -> None:
+    """Log a WARN when `nextFundingTime` is within the settlement guard window.
+
+    The signal is NOT suppressed — funding rates are about to flip at
+    `nextFundingTime`, which is a real edge artifact and the operator should
+    see it in logs. `settings.binance_settlement_guard_s` controls the window
+    (default 300s = 5 min). Best-effort: malformed/missing input is silently
+    ignored (we don't WARN twice on bad rate + bad time).
+    """
+    if not isinstance(next_funding_time_ms, (int, float)):
+        return
+    try:
+        nft_ms = int(next_funding_time_ms)
+    except (ValueError, TypeError):
+        return
+    now_ms = int(time.time() * 1000)
+    seconds_to_settle = (nft_ms - now_ms) / 1000.0
+    guard_s = settings.binance_settlement_guard_s
+    # Only WARN when we're approaching settlement (positive but small). After
+    # settlement nextFundingTime jumps ahead 8h, so a large positive value is
+    # fine. A negative value means Binance hasn't updated the field yet —
+    # treat as "post-settle" and skip the warn.
+    if 0 < seconds_to_settle < guard_s:
+        log.warning(
+            "binance_funding.near_settlement market=%s seconds_to_settle=%d",
+            alias, int(seconds_to_settle),
+        )
 
 
 def _parse_funding_rate(raw: Any) -> float | None:
@@ -129,6 +166,9 @@ async def fetch_cex_funding_live(market: str) -> float | None:
             market, symbol, body.get("lastFundingRate"),
         )
         return None
+    # Trap-surface WARN: when `nextFundingTime` is within the guard window
+    # the rate is about to flip — the operator needs to see this in logs.
+    _check_near_settlement(market, body.get("nextFundingTime"))
     log.info(
         "binance_funding.read_ok alias=%s symbol=%s rate_per_8h=%.8f",
         market, symbol, rate,
@@ -189,6 +229,9 @@ async def fetch_all_cex_fundings() -> dict[str, float]:
                 alias, symbol, entry.get("lastFundingRate"),
             )
             continue
+        # Trap-surface WARN: per-symbol settlement-window check in the batch
+        # path. Same semantics as the single-market path.
+        _check_near_settlement(alias, entry.get("nextFundingTime"))
         out[alias] = rate
 
     log.info(

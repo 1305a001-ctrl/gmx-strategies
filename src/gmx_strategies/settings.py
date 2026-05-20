@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     # at 60s cadence than 5 separate calls. Set False to use per-market calls
     # (useful for debugging or if Binance starts rate-limiting the no-symbol path).
     binance_funding_batch: bool = True
+    # Stale-near-settlement guard window (seconds). When `nextFundingTime` is
+    # within this window of `now()`, the funding reader logs a WARN. The signal
+    # is NOT suppressed — the rate is about to flip, which is a real edge
+    # artifact the operator should know about (5min default = enough to spot
+    # in logs before the new rate prints).
+    binance_settlement_guard_s: int = 300
 
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
@@ -89,6 +95,34 @@ class Settings(BaseSettings):
     http_port: int = 8013
 
     log_level: str = "INFO"
+
+    # --- Watchdog (trap monitors, see watchdog.py / cli.py) ---
+    # Canonical source for the current GMX V2 Arbitrum Reader address.
+    # The watchdog re-pulls this at run-time and compares against
+    # `gmx_reader_address_arbitrum` to detect a GMX redeploy (the trap that
+    # already burned us once — see memory/arch_gmx_v2_audit.md addendum
+    # 2026-05-20).
+    gmx_reader_github_url: str = (
+        "https://raw.githubusercontent.com/gmx-io/gmx-synthetics/main/"
+        "deployments/arbitrum/Reader.json"
+    )
+    # HyperLend Aave-V3-style Oracle on HyperEVM. setSourceOfAsset is a
+    # governance-callable mutator; a rotation away from
+    # `expected_hyperlend_whype_source` would silently flip the source OCDE
+    # is meant to track. Watchdog checks the live mapping every run.
+    hyperlend_oracle_address: str = "0xC9Fb4fbE842d57EAc1dF3e641a281827493A630e"
+    hyperlend_whype_token: str = "0x5555555555555555555555555555555555555555"  # noqa: S105 — token addr, not secret
+    expected_hyperlend_whype_source: str = "0x40EA33eA76Fbe35e9FB422eDd175b8c8D84A63Cc"
+    hyperevm_rpc_url: str = "https://rpc.hyperliquid.xyz/evm"
+
+    # Where the watchdog publishes drift alerts when invoked with --emit-alerts.
+    # XADD with maxlen=10_000 (approx). Consumed via XREAD by an operator
+    # tail / alert relay.
+    trap_alerts_stream: str = "trap_alerts:gmx"
+    trap_alerts_maxlen: int = 10_000
+    # HTTP timeout (seconds) for watchdog HTTPS GETs to GitHub. GitHub raw
+    # is usually <500ms; 10s leaves wide headroom for slow CI runners.
+    watchdog_http_timeout_s: float = 10.0
 
 
 settings = Settings()
