@@ -749,3 +749,121 @@ against unrelated symbols return `None` instead of hitting Binance.
   retries on `-4131` (PERCENT_PRICE filter rejects under volatility)
   is a candidate for G6.5.
 
+## G7.3 — Pilot guard
+
+The pilot guard (`pilot_guard.py`) is the LAST safety belt before every
+order placement. `PilotGuard.check(market, notional_usd)` returns a
+`GuardResult` with `allowed: bool` — the caller (G7.1's runtime, next
+PR) MUST abort if `allowed=False`. The guard itself does NOT prevent
+submission; it signals.
+
+This module ships standalone. Wiring it into the funding-arb runtime
+happens in G7.1.
+
+### Gate stack (in order — first denial wins)
+
+| # | Gate | Default | Source of truth | Override |
+|--:|------|---------|-----------------|----------|
+| 1 | `killswitch` | unset | Redis `funding_arb:killswitch` | `redis-cli SET funding_arb:killswitch 1` to halt; `DEL` to resume |
+| 2 | `not_armed` | empty (deny all) | `funding_arb_armed_markets_csv` | env: `FUNDING_ARB_ARMED_MARKETS_CSV=sol` |
+| 3 | `size_cap` | $10 | `funding_arb_pilot_position_cap_usd` | env: `FUNDING_ARB_PILOT_POSITION_CAP_USD=15` |
+| 4 | `daily_pnl` | -$50 | `funding_arb_pilot_daily_pnl_floor_usd` | env: `FUNDING_ARB_PILOT_DAILY_PNL_FLOOR_USD=-100` |
+| 5 | `concurrent` | 1 | `funding_arb_pilot_max_concurrent` | env: `FUNDING_ARB_PILOT_MAX_CONCURRENT=2` |
+| 6 | `cooldown` | 1800s | `funding_arb_pilot_loss_cooldown_s` | env: `FUNDING_ARB_PILOT_LOSS_COOLDOWN_S=3600` |
+
+**Default-deny posture:** with `funding_arb_armed_markets_csv=""` (the
+default) NOTHING trades, regardless of `live_gmx_enabled` /
+`live_binance_enabled`. The operator MUST explicitly opt in per-market.
+
+**Killswitch read-failure trips SAFE:** if Redis is unreachable when
+the guard tries to read the killswitch key, the guard treats it as
+TRIPPED (denied). The operator is already in trouble if Redis is down;
+silently letting orders through with an unverified killswitch is the
+worse failure mode.
+
+### Operator workflow — taking a market live
+
+```
+# 1. Flip the per-venue live gates (separate from this guard)
+export LIVE_GMX_ENABLED=true
+export LIVE_BINANCE_ENABLED=true
+
+# 2. Arm ONE market (default-deny means you must opt in per-market)
+export FUNDING_ARB_ARMED_MARKETS_CSV=sol
+
+# 3. Confirm the guard would allow
+python -m gmx_strategies.cli g7_guard_status
+
+# 4. Start the consumer (G7.1, next PR — not yet shipped)
+```
+
+### Killswitch — the primary emergency stop
+
+```
+# Halt the entire executor instantly. Every subsequent guard check
+# returns allowed=False with gate=killswitch.
+ssh ai-primary 'docker exec redis redis-cli -a $REDIS_PASS \
+    SET funding_arb:killswitch 1'
+
+# Resume after investigation
+ssh ai-primary 'docker exec redis redis-cli -a $REDIS_PASS \
+    DEL funding_arb:killswitch'
+```
+
+The killswitch is checked FIRST on every `guard.check()` call. No
+other state matters when it's tripped — even arming a market, lowering
+the size cap, etc. all become irrelevant. This is on purpose: a single
+flip kills broadcasting instantly.
+
+For programmatic flips from inside the executor (G7.1), prefer the
+module-level helpers:
+
+```python
+from gmx_strategies.pilot_guard import (
+    trip_killswitch, reset_killswitch, record_loss,
+)
+
+await trip_killswitch(reason="open_position_diverged_from_expected")
+await record_loss(int(time.time() * 1000))  # starts the cooldown
+```
+
+### `g7_guard_status` CLI
+
+```
+python -m gmx_strategies.cli g7_guard_status
+```
+
+Prints the live `GuardState` (every gate input on its own line) then
+runs `PilotGuard.check()` at the pilot cap for each market in
+`monitored_markets`. Per-market results print as `[ALLOW]` or `[DENY ]`
+with the gate tag.
+
+Read-only / never broadcasts. Always exits 0 (informational).
+
+### Denial audit trail — `funding_arb:guard_blocks` stream
+
+Every denial is XADD'd to `funding_arb:guard_blocks` with
+`{ts_ms, market, notional_usd, side, gate, reason}`. Approximate
+maxlen=`guard_blocks_maxlen` (100k).
+
+Operator query:
+
+```
+# Show the last 20 denials
+docker exec redis redis-cli -a $REDIS_PASS \
+    XREVRANGE funding_arb:guard_blocks + - COUNT 20
+```
+
+XADD failures DO NOT promote allow → deny. The guard's decision is
+the safety belt; the log is the audit trail.
+
+### Out of scope (G7.3 → G7.1)
+
+- **No runtime wiring.** G7.3 ships the guard module standalone. The
+  funding-arb runtime is still paper-only. G7.1 is the consumer that
+  will call `guard.check()` before every `place_market_order`.
+- **No exits / TP / SL.** The guard refuses to OPEN; it doesn't
+  participate in closing logic. Exits are G7.1's job.
+- **No risk-watcher integration.** G7.1 may add a subscription to
+  external halt streams; the guard itself is self-contained.
+

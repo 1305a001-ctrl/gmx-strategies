@@ -15,6 +15,11 @@ Subcommands:
                           read-side stack (auth, exchangeInfo, funding, position
                           mode, account balance, position info) against the
                           configured base URL (typically demo-fapi.binance.com).
+  - `g7_guard_status`   — G7.3 pilot-guard status snapshot. Prints the
+                          GuardState (killswitch / pnl / positions / cooldown
+                          / armed markets) + runs PilotGuard.check() at the
+                          pilot cap for each monitored market. Read-only,
+                          always exits 0.
   - `g6_dry_run_order`  — G6.4 order-placement dry-run. Constructs a $5 SOLUSDT
                           BUY MARKET order at the current Binance mark price
                           and runs `place_market_order(dry_run=True)`. NEVER
@@ -60,6 +65,7 @@ Manual invocation:
     python -m gmx_strategies.cli g6_smoke
     python -m gmx_strategies.cli g6_smoke --force-refresh-exchange-info
     python -m gmx_strategies.cli g6_dry_run_order
+    python -m gmx_strategies.cli g7_guard_status
 
 Exit codes:
     0 — all checks OK or WARN only / signer smoke acceptable /
@@ -866,6 +872,90 @@ async def _g6_dry_run_order_main(args: argparse.Namespace) -> int:  # noqa: ARG0
     return 0
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# g7_guard_status — G7.3 pilot-guard status snapshot
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Paper-safe / read-only. Prints the GuardState snapshot as a clean table
+# (every field on its own line) then runs `guard.check()` against each
+# monitored market at `pilot_position_cap_usd` so the operator can see
+# at a glance which markets would be allowed RIGHT NOW.
+#
+# ALWAYS exits 0 — informational only. Operational gates are enforced at
+# the call site in G7.1, not here.
+#
+# Operator flow to take a market live (mirrored in the README):
+#   1. flip `live_gmx_enabled=True` AND `live_binance_enabled=True`
+#   2. set `funding_arb_armed_markets_csv=sol` (or whatever pilot market)
+#   3. run `python -m gmx_strategies.cli g7_guard_status` to confirm
+#   4. start the consumer (G7.1, next PR)
+
+
+async def _g7_guard_status_main(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Print the live pilot-guard snapshot + per-market check results."""
+    from gmx_strategies import pilot_guard
+
+    print("G7.3 pilot-guard status — read-only snapshot")
+    print(f"  redis_url: {settings.redis_url}")
+    print(
+        f"  live_gmx_enabled: {settings.live_gmx_enabled} "
+        f"live_binance_enabled: {settings.live_binance_enabled}",
+    )
+    print()
+
+    guard = pilot_guard.PilotGuard()
+    state = await guard.state()
+
+    # State table — one field per line, fixed-width for grep-friendliness.
+    print("GuardState:")
+    print(f"  killswitch_set:           {state.killswitch_set}")
+    print(
+        f"  today_pnl_usd:            ${state.today_pnl_usd:.2f} "
+        f"(floor ${state.today_pnl_floor_usd:.2f})",
+    )
+    print(f"  open_gmx_positions:       {state.open_gmx_positions}")
+    print(f"  open_binance_positions:   {state.open_binance_positions}")
+    print(f"  max_concurrent:           {state.max_concurrent}")
+    armed_list = sorted(state.armed_markets) or ["<none — DEFAULT-DENY>"]
+    print(f"  armed_markets:            {armed_list}")
+    print(f"  pilot_position_cap_usd:   ${state.pilot_position_cap_usd:.2f}")
+    print(f"  last_loss_ts_ms:          {state.last_loss_ts_ms}")
+    print(f"  cooldown_remaining_s:     {state.cooldown_remaining_s}")
+    print()
+
+    # Per-market check at the pilot cap. The cap-sized check is the most
+    # operator-actionable signal: "if I tried to open a pilot-sized
+    # position in this market RIGHT NOW, would the guard allow it?"
+    print(
+        f"Per-market check at notional=${state.pilot_position_cap_usd:.2f}:",
+    )
+    cap = state.pilot_position_cap_usd
+    markets = [m.strip() for m in settings.monitored_markets.split(",") if m.strip()]
+    if not markets:
+        print("  <no monitored_markets configured>", file=sys.stderr)
+    for market in markets:
+        result = await guard.check(market, cap)
+        marker = "[ALLOW]" if result.allowed else "[DENY ]"
+        if result.allowed:
+            print(f"  {marker} {market:<5} allowed")
+        else:
+            print(f"  {marker} {market:<5} gate={result.gate} reason={result.reason}")
+
+    # Operator-friendly nudge if armed_markets is empty — the most common
+    # "why isn't anything allowed?" question. Stderr so it's distinct
+    # from the table.
+    if not state.armed_markets:
+        print(
+            "\nNOTE: funding_arb_armed_markets_csv is empty — DEFAULT-DENY "
+            "is in effect. To arm a market, e.g. SOL:\n"
+            "  export FUNDING_ARB_ARMED_MARKETS_CSV=sol\n"
+            "Or add to your .env. Then re-run this command to confirm.",
+            file=sys.stderr,
+        )
+
+    return 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gmx_strategies.cli",
@@ -933,6 +1023,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "dry_run=True. NEVER broadcasts. Prints the would-be signed params."
         ),
     )
+
+    sub.add_parser(
+        "g7_guard_status",
+        help=(
+            "G7.3 pilot-guard status snapshot. Prints every gate input + "
+            "runs PilotGuard.check() for each monitored market at the pilot "
+            "position cap. Read-only; never broadcasts. Always exits 0."
+        ),
+    )
     return p
 
 
@@ -954,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_g6_smoke_main(args))
     if args.subcommand == "g6_dry_run_order":
         return asyncio.run(_g6_dry_run_order_main(args))
+    if args.subcommand == "g7_guard_status":
+        return asyncio.run(_g7_guard_status_main(args))
     parser.print_help()
     return 1
 
