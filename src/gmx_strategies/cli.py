@@ -956,6 +956,113 @@ async def _g7_guard_status_main(args: argparse.Namespace) -> int:  # noqa: ARG00
     return 0
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# g7_consumer_smoke — G7.1 funding-arb consumer one-shot smoke
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Paper-safe — invokes `FundingArbExecutor.handle_signal` ONCE on a synthetic
+# SOL short_gmx_long_cex signal, with dry_run hard-coded True for both legs
+# (regardless of `settings.funding_arb_executor_dry_run`). The CLI itself
+# patches the dry_run flag for the duration of the call — see notes inline.
+#
+# What the smoke validates:
+#   - Synthetic signal payload parses through the consumer pipeline.
+#   - PilotGuard.check() is called once; result is included in the record.
+#   - If the operator has armed SOL, the GMX + Binance dry-run legs both
+#     attempt their respective construction paths.
+#   - The ExecutionRecord is XADD'd to `funding_arb:executions` (visible
+#     via `XREVRANGE funding_arb:executions + - COUNT 1`).
+#
+# Exit codes:
+#   0 — handle_signal completed without raising (any outcome is fine —
+#       guard denial is success-shaped here)
+#   2 — handle_signal raised an unexpected exception
+
+
+async def _g7_consumer_smoke_main(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Run the G7.1 consumer smoke — never broadcasts."""
+    from gmx_strategies import funding_arb_executor
+
+    # HARD-CODE dry_run=True for the smoke regardless of env settings.
+    # We patch the settings field locally for the duration of this call,
+    # then restore it — both for safety and so the operator sees the
+    # actual setting reflected in the printed record.
+    original_dry_run = settings.funding_arb_executor_dry_run
+    settings.funding_arb_executor_dry_run = True
+
+    print("G7.1 funding-arb consumer smoke — DRY-RUN ONLY")
+    print(f"  signals_channel: {settings.funding_arb_signals_channel}")
+    print(
+        f"  consumer_enabled (setting): {settings.funding_arb_consumer_enabled} "
+        "(this CLI runs the executor once regardless)",
+    )
+    print(
+        f"  executor_dry_run (forced True for smoke): "
+        f"original={original_dry_run}, smoke_uses=True",
+    )
+    print(
+        f"  live_gmx_enabled: {settings.live_gmx_enabled} "
+        f"live_binance_enabled: {settings.live_binance_enabled}",
+    )
+    print()
+
+    # Synthetic SOL signal — matches the funding_arb_runtime emit shape
+    # (short_gmx_long_cex direction at $10 notional). Picking SOL so the
+    # alt-band slippage tolerance + the SOLUSDT min-notional ($5) make
+    # the construction succeed when the operator has armed SOL.
+    signal: dict[str, Any] = {
+        "ts": 0,
+        "market": "sol",
+        "direction": "short_gmx_long_cex",
+        "funding_rate_per_8h": 0.001,
+        "annualized_yield_pct": 109.5,
+        "target_position_usd": 10.0,
+        "cex_rate_per_8h": 0.0,
+        "net_rate_per_8h": 0.001,
+        "cex_source": "mock",
+        "mode": "paper",
+    }
+    print("synthetic signal:")
+    for k, v in signal.items():
+        print(f"  {k}: {v!r}")
+    print()
+
+    executor = funding_arb_executor.FundingArbExecutor()
+    try:
+        record = await executor.handle_signal(signal)
+    except Exception as exc:  # noqa: BLE001 — surface as exit code 2
+        print(f"ERROR: handle_signal raised: {exc.__class__.__name__}: {exc}")
+        settings.funding_arb_executor_dry_run = original_dry_run
+        return 2
+    finally:
+        # Restore the setting whether or not we raised.
+        settings.funding_arb_executor_dry_run = original_dry_run
+
+    # Pretty-print the record. Avoid dumping any sub-result that might
+    # carry sensitive fields; only the cardinal fields go to stdout.
+    print("ExecutionRecord:")
+    print(f"  ts_ms:               {record.ts_ms}")
+    print(f"  market:              {record.market}")
+    print(f"  direction:           {record.direction}")
+    print(f"  notional_usd_target: ${record.notional_usd_target:.2f}")
+    print(f"  success_both_legs:   {record.success_both_legs}")
+    print(f"  realized_pnl_usd:    ${record.realized_pnl_usd:.4f}")
+    print(f"  gmx_tx_hash:         {record.gmx_tx_hash}")
+    print(f"  binance_order_id:    {record.binance_order_id}")
+    print(f"  guard_block:         {record.guard_block}")
+    print(f"  reconcile_block:     {record.reconcile_block}")
+    print(f"  error:               {record.error}")
+    # gmx_result / binance_result kept brief — print the keys only so a
+    # secrets-bearing field can't sneak into a log paste.
+    gmx_keys = list(record.gmx_result.keys()) if record.gmx_result else None
+    bnc_keys = list(record.binance_result.keys()) if record.binance_result else None
+    print(f"  gmx_result keys:     {gmx_keys}")
+    print(f"  binance_result keys: {bnc_keys}")
+    print()
+    print("exit_code: 0 (handle_signal completed)")
+    return 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gmx_strategies.cli",
@@ -1032,6 +1139,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "position cap. Read-only; never broadcasts. Always exits 0."
         ),
     )
+
+    sub.add_parser(
+        "g7_consumer_smoke",
+        help=(
+            "G7.1 funding-arb consumer smoke. Constructs a synthetic SOL "
+            "short_gmx_long_cex signal at $10 and runs "
+            "FundingArbExecutor.handle_signal ONCE with dry_run hard-coded "
+            "True. NEVER broadcasts. Prints the ExecutionRecord."
+        ),
+    )
     return p
 
 
@@ -1055,6 +1172,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_g6_dry_run_order_main(args))
     if args.subcommand == "g7_guard_status":
         return asyncio.run(_g7_guard_status_main(args))
+    if args.subcommand == "g7_consumer_smoke":
+        return asyncio.run(_g7_consumer_smoke_main(args))
     parser.print_help()
     return 1
 

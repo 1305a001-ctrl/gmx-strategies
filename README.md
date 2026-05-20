@@ -867,3 +867,131 @@ the safety belt; the log is the audit trail.
 - **No risk-watcher integration.** G7.1 may add a subscription to
   external halt streams; the guard itself is self-contained.
 
+
+## G7.1 — Consumer wiring (signal → executor)
+
+The runtime module that closes the loop between the signal pipeline
+(G2/G3 — `funding_arb_runtime.py` emits to `funding_arb:signals`
+pub/sub) and the executor stack (G5.x GMX + G6.x Binance), gated by
+G7.3 `PilotGuard`. Module: `funding_arb_executor.py`.
+
+After this PR lands, every module exists and is wired together —
+sitting cold in **consumer-disabled, dry-run-on, default-deny** posture,
+awaiting either a new strategy thesis or an explicit operator opt-in.
+
+### The 5-gate ladder
+
+ALL FIVE must hold before any real broadcast leaves the box:
+
+| # | Gate | Setting / source | Default |
+|--:|------|------------------|---------|
+| 1 | `funding_arb_consumer_enabled` | env / settings | `False` |
+| 2a | `live_gmx_enabled` (GMX leg) | env / settings | `False` |
+| 2b | `live_binance_enabled` (Binance leg) | env / settings | `False` |
+| 3 | `PilotGuard.check().allowed == True` | `funding_arb_armed_markets_csv` + 5 other gates | default-deny |
+| 4 | `reconcile_intent(...).action != "ABORT"` | on-chain Position read | derived |
+| 5 | `funding_arb_executor_dry_run == False` | env / settings | `True` |
+
+ANY missing → simulate, refuse, or log only. NEVER broadcasts.
+
+Gate 1 is the HARD GATE: when False, the consumer module is never
+instantiated at all and `FundingArbExecutor.run` is not in the
+`asyncio.gather` task list. Restart required after flipping — the
+gate is read ONCE at startup, deliberately.
+
+### Full live-flip recipe
+
+The 4 env vars + 1 Redis setting the operator needs to flip:
+
+```
+# 1. Per-venue live gates (G5.2 + G6.4)
+export LIVE_GMX_ENABLED=true
+export LIVE_BINANCE_ENABLED=true
+
+# 2. Arm ONE market (default-deny means you must opt in per-market)
+export FUNDING_ARB_ARMED_MARKETS_CSV=sol
+
+# 3. Hard gate for the consumer (this PR — G7.1)
+export FUNDING_ARB_CONSUMER_ENABLED=true
+
+# 4. The dry-run kill switch — flip last, only when ready
+export FUNDING_ARB_EXECUTOR_DRY_RUN=false
+
+# 5. Confirm the guard would allow before restart
+python -m gmx_strategies.cli g7_guard_status
+
+# 6. Verify the killswitch in Redis is NOT set (default ok)
+docker exec redis redis-cli -a $REDIS_PASS GET funding_arb:killswitch
+# (expect "(nil)")
+
+# 7. Restart the container — consumer-enabled is read once at startup
+```
+
+Rollback: any of the 4 env vars → False (and restart) immediately
+returns the consumer to safe state. The instant kill is the killswitch:
+
+```
+docker exec redis redis-cli -a $REDIS_PASS SET funding_arb:killswitch 1
+```
+
+### `funding_arb:executions` stream shape
+
+Every signal that reaches `handle_signal` produces ONE XADD to this
+stream — even guard-denied and reconcile-aborted ones, so the audit
+trail is complete and the `PilotGuard.G4 daily_pnl` gate sees every
+realized PnL value.
+
+| Field | Type | Notes |
+|---|---|---|
+| `ts_ms` | str (int) | unix-ms when the consumer received the signal |
+| `market` | str | alias (`sol`, `eth`, …) |
+| `direction` | str | `short_gmx_long_cex` or `long_gmx_short_cex` |
+| `notional_usd_target` | str (float) | target size before exchange snap-rounding |
+| `success_both_legs` | str (`0`/`1`) | True only when BOTH legs cleanly submit/simulate |
+| `realized_pnl_usd` | str (float) | **0.0 on every fresh fill** (G7.2 will populate from settlement) |
+| `error` | str (optional) | composed error message from both legs, when any |
+| `gmx_tx_hash` | str (optional) | when GMX broadcast succeeded |
+| `binance_order_id` | str (optional) | when Binance broadcast succeeded |
+| `gmx_result_json` | str (JSON) | full serialized `SendResult` |
+| `binance_result_json` | str (JSON) | full serialized `OrderResult` |
+| `guard_block_json` | str (JSON, optional) | populated on guard denial |
+| `reconcile_block_json` | str (JSON, optional) | populated on reconcile ABORT |
+
+The G4 daily_pnl gate sums `realized_pnl_usd` across today's entries.
+Because G7.1 ships with `realized_pnl_usd = 0.0` on every fresh fill,
+the gate cannot trip spuriously on a paper-only consumer. The
+settlement loop in G7.2 (future) will update closed positions with
+actual realized PnL.
+
+### `g7_consumer_smoke` CLI
+
+```
+python -m gmx_strategies.cli g7_consumer_smoke
+```
+
+Constructs a synthetic SOL `short_gmx_long_cex` signal at $10 and
+invokes `FundingArbExecutor.handle_signal()` ONCE with `dry_run`
+hard-coded to True (irrespective of any env override). NEVER
+broadcasts. Prints the resulting `ExecutionRecord` so the operator
+can verify the pipeline composes correctly before flipping the
+consumer-enabled gate.
+
+Exit codes:
+- `0` — handle_signal completed (any outcome is fine; guard denial
+        is success-shaped for this CLI)
+- `2` — handle_signal raised an unhandled exception
+
+### Out of scope (G7.1 → G7.2)
+
+- **No settlement loop.** `realized_pnl_usd` is always 0.0. G7.2 will
+  add the position-tracker that updates PnL when positions close.
+- **No exits / TP / SL.** The consumer only OPENS. Closing logic is
+  out-of-scope for G7.1; the operator handles closes via direct GMX
+  + Binance UI for now.
+- **No retry on partial failure.** If a leg fails mid-flight, the
+  operator reconciles manually. `binance_order.get_order_status` and
+  `gmx_position_reader.fetch_account_positions` are the audit tools.
+- **No mark-price plumbing.** The Binance hedge leg sizing uses a
+  fallback $1.00 mark price when no `mark_price_fn` is wired. G7.2
+  plumbs `/fapi/v1/premiumIndex` through.
+
