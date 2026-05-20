@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     # window. 5000ms is the Binance default and is fine for ai-primary's
     # <2s clock drift.
     binance_recv_window_ms: int = 5000
+    # Prefix for `newClientOrderId` generation in `binance_order.py` (G6.4).
+    # Binance accepts a 1-36 char id matching `^[\.A-Z\:/a-z0-9_-]{1,36}$`.
+    # The prefix tags every G6 order so the operator can grep them out of
+    # the Binance UI / trade history. We append `uuid4().hex[:16]` for the
+    # unique tail — total length 31 chars, well under the 36 cap.
+    binance_order_idempotency_prefix: str = "gmx-strategies-"
 
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).

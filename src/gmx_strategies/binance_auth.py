@@ -264,6 +264,24 @@ async def signed_post(
     return await _signed_request("POST", path, params or {}, client=client)
 
 
+async def signed_delete(
+    path: str,
+    params: dict[str, str | int | float] | None = None,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any] | list[Any] | None:
+    """Issue a signed DELETE to `<binance_fapi_base_url><path>` with `params`.
+
+    Used for `DELETE /fapi/v1/order` (cancel) — added in G6.4 alongside
+    order placement. Same HMAC pattern as `signed_get` / `signed_post`;
+    method is the only diff. Binance accepts cancel params on the query
+    string with an empty body, identical to the POST convention.
+
+    Returns the parsed JSON body or None on ANY failure. NEVER raises.
+    """
+    return await _signed_request("DELETE", path, params or {}, client=client)
+
+
 async def _signed_request(
     method: str,
     path: str,
@@ -358,6 +376,7 @@ async def _signed_request(
 
 
 __all__ = [
+    "signed_delete",
     "signed_get",
     "signed_post",
 ]

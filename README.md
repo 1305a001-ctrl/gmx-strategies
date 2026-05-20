@@ -600,6 +600,152 @@ propagates, pass `--force-refresh-exchange-info` to skip the cache.
 
 ### Out of scope (G6.4)
 
-This CLI does NOT place orders. The G6.4 PR will add a
-`g6_dry_run_order` subcommand that signs a $5 testnet MARKET order
-end-to-end. Until then, the order-placement surface remains unwired.
+The `g6_smoke` CLI itself does NOT place orders — it remains read-only.
+G6.4 ships the order-placement capability in `binance_order.py` and adds
+a separate `g6_dry_run_order` subcommand for the order-construction
+shakedown (see next section). Live broadcasting requires
+`settings.live_binance_enabled=True` AND `dry_run=False` AND one-way
+position mode — explicit operator opt-in on every axis.
+
+## G6.4 — Order placement
+
+`src/gmx_strategies/binance_order.py` is the actual order-placement
+surface for the CEX hedge leg. It uses G6.1's filter cache for sizing,
+G6.2's `signed_post` / `signed_get` / `signed_delete` for HMAC, and
+G6.2's `assert_one_way_position_mode` as a refuse-to-broadcast gate.
+
+**This module ships the capability but does NOT wire it into the
+funding-arb runtime.** G7.1 will consume `funding_arb:signals` and call
+`place_market_order(dry_run=False)` after risk-watcher's gates clear.
+Until then, G6.4 sits as reusable executor infrastructure — safe to
+import, impossible to broadcast.
+
+### Gate stack (`place_market_order`)
+
+| `dry_run` | `live_binance_enabled` | position-mode | Broadcast? |
+|-----------|------------------------|---------------|------------|
+| True      | any                    | any           | NO (sim)   |
+| False     | False                  | any           | NO (gate)  |
+| False     | True                   | HEDGE / unkn  | NO (gate)  |
+| False     | True                   | one-way       | YES        |
+
+NO real broadcast unless ALL THREE: `dry_run=False` AND
+`live_binance_enabled=True` AND position-mode is one-way. Mirrors the
+GMX side's `submit_signed` gate matrix exactly.
+
+When a gate refuses, `OrderResult.gate_blocked` is set to a stable
+identifier (`live_binance_enabled=False` or `hedge_mode_or_api_down`),
+`submitted=False`, and the would-be-signed params land on
+`dry_run_request` so the operator can inspect what would have been
+sent without anything reaching Binance.
+
+### Symbol / side / type whitelist
+
+Even if `exchangeInfo` has it, we refuse anything outside the
+funding-arb basket:
+
+- **Symbols**: `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `DOGEUSDT`, `XRPUSDT`
+- **Sides**: `BUY`, `SELL`
+- **Types**: `MARKET` (LIMIT is scoped out for G6.4)
+
+Per audit §H1: BTC's $50 `MIN_NOTIONAL` is 5x the current $10/trade cap.
+The order module enforces the min via `passes_min_notional` BEFORE
+submission — at the current cap, BTC orders are rejected locally with
+`error_msg="below_min_notional ..."`. SOL / DOGE / XRP min_notional = $5
+and are tradeable at the cap; ETH min = $20 requires a per-symbol cap
+override before it becomes usable.
+
+### Idempotency (`newClientOrderId`)
+
+Every order carries a `newClientOrderId` of the form:
+
+    <settings.binance_order_idempotency_prefix><uuid4_hex[:16]>
+
+Default prefix `gmx-strategies-` + 16 hex chars = 31 chars total
+(Binance cap is 36, regex `^[\\.A-Z\\:/a-z0-9_-]{1,36}$`).
+
+Auto-generation happens when the caller passes `client_order_id=None`
+(the default). Callers can pre-generate and pass a fixed
+`client_order_id` for the audit §12 reconciliation pattern: on any
+network-ambiguous failure (request sent, response truncated, timeout),
+call `get_order_status(symbol, client_order_id=<same>)`. If the order
+exists, you get its canonical state in one round-trip. If not, retry
+the submit with the same id — Binance treats it as a fresh order, the
+retry is idempotent because the query would have found a duplicate.
+
+### Error-code mapping
+
+Audit §12 catalogs the codes; G6.4 maps each to a stable slug on
+`OrderResult.error_slug`:
+
+| Binance code | Slug                                |
+|-------------:|-------------------------------------|
+| -1013        | `invalid_message_or_lot_size`       |
+| -1111        | `precision_mismatch`                |
+| -2010        | `new_order_rejected`                |
+| -2019        | `margin_not_sufficient`             |
+| -4061        | `position_side_not_match_hedge_mode`|
+| -4164        | `below_min_notional_exchange`       |
+
+Unknown codes surface `error_code` (raw int) + `error_msg` (raw Binance
+message) with `error_slug=None`. Local pre-flight rejections use
+`error_code=-1` (different from any real Binance code) and leave
+`error_slug=None`.
+
+### `g6_dry_run_order` CLI
+
+```bash
+python -m gmx_strategies.cli g6_dry_run_order
+```
+
+Hard-coded to construct a $6 SOLUSDT BUY MARKET order at the current
+Binance mark price (read live from public `/fapi/v1/premiumIndex`) and
+call `place_market_order(dry_run=True)`. **NEVER broadcasts** — even
+with `live_binance_enabled=True`, the `dry_run=True` argument is
+hard-wired in the CLI handler. The only way to live-broadcast is via a
+runtime that explicitly opts in (G7.1).
+
+The CLI uses $6 (not $5) because SOL's $5 min_notional + 0.01 lot_step
+means a $5 target with SOL above ~$50 rounds down below the min. The
+extra $1 of headroom keeps the dry-run-request constructible across
+the realistic SOL price range. The spec intent ("approximately $5") is
+preserved.
+
+Output: the verbatim `OrderResult.dry_run_request` dict — what would
+have been signed and POSTed. Exit codes:
+
+| Exit | Meaning |
+|-----:|---------|
+| 0 | `dry_run_request` constructed cleanly (ready for G7.1 wiring) |
+| 2 | A pre-flight check failed (below min_notional, bad symbol, lot-step underflow) |
+| 3 | exchange_info or mark-price read failed (no sizing possible) |
+
+### Reconciliation helpers
+
+- `get_order_status(symbol, order_id=..., client_order_id=...)` —
+  reads `GET /fapi/v1/order` and returns an `OrderResult` with the
+  canonical exchange state. Caller can use either an `order_id` or a
+  `client_order_id`.
+- `cancel_order(symbol, order_id=..., client_order_id=...)` — issues
+  `DELETE /fapi/v1/order`. Rarely useful for MARKET (fills immediately)
+  but here for LIMIT iterations (G6.5+) and cleanup paths.
+
+Both enforce the symbol whitelist even on reads — typo-driven queries
+against unrelated symbols return `None` instead of hitting Binance.
+
+### Out of scope (G6.4 → G7.1)
+
+- **No funding-arb runtime wiring.** The runtime stays paper-only. G7.1
+  is the consumer.
+- **No retry / nonce-recycle logic.** Each `place_market_order` call
+  generates a fresh `client_order_id` unless the caller supplies one.
+  Retries are the caller's job (use the same id).
+- **No risk-watcher integration.** When G7.1 lands, it will route via
+  `place_market_order(dry_run=False)` only after risk-watcher's gates
+  clear; the order module itself does not subscribe to halts.
+- **No position reconciliation loop.** Per-symbol position polling
+  belongs in G7.1's reconciler, not here.
+- **No LIMIT orders.** MARKET-only ships in G6.4. LIMIT-IOC for taker
+  retries on `-4131` (PERCENT_PRICE filter rejects under volatility)
+  is a candidate for G6.5.
+

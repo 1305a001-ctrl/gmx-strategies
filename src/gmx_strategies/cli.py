@@ -10,6 +10,18 @@ Subcommands:
                           position mode, account balance, position info)
                           against the configured base URL (typically
                           demo-fapi.binance.com).
+  - `g6_smoke`          — G6.3 Binance Futures testnet/mainnet shakedown.
+                          Operator-invoked one-shot validation of the entire G6
+                          read-side stack (auth, exchangeInfo, funding, position
+                          mode, account balance, position info) against the
+                          configured base URL (typically demo-fapi.binance.com).
+  - `g6_dry_run_order`  — G6.4 order-placement dry-run. Constructs a $5 SOLUSDT
+                          BUY MARKET order at the current Binance mark price
+                          and runs `place_market_order(dry_run=True)`. NEVER
+                          broadcasts. Operator-invoked validation that the
+                          full order-construction surface (exchangeInfo
+                          rounding + funding mark-price read + client-order-id
+                          generation) produces a valid signed-params payload.
 
 `watchdog`:
   Cron on ai-primary (every ~30 minutes). Runs every check in `watchdog.py`,
@@ -47,20 +59,27 @@ Manual invocation:
     python -m gmx_strategies.cli g5_position_smoke
     python -m gmx_strategies.cli g6_smoke
     python -m gmx_strategies.cli g6_smoke --force-refresh-exchange-info
+    python -m gmx_strategies.cli g6_dry_run_order
 
 Exit codes:
     0 — all checks OK or WARN only / signer smoke acceptable /
         position smoke OK
+        g6_dry_run_order: dry_run_request constructed cleanly
     1 — CLI usage / argument error (argparse default)
     2 — watchdog: at least one CRITICAL drift found;
         g5_sign_smoke: critical-fail revert;
         g5_position_smoke: decoder failed (unexpected non-empty / malformed);
         g6_smoke: at least one functional check failed (hedge mode, missing
-        market filter, etc.)
+        market filter, etc.);
+        g6_dry_run_order: a pre-flight check failed (below min_notional,
+        bad symbol, lot-step underflow, etc.)
     3 — watchdog: at least one ERROR (watchdog itself couldn't reach a source);
         g5_sign_smoke: could not load the executor key;
         g5_position_smoke: RPC unreachable;
         g6_smoke: credentials not configured (BINANCE_API_KEY/SECRET unset).
+        g6_smoke: credentials not configured (BINANCE_API_KEY/SECRET unset);
+        g6_dry_run_order: exchange_info or funding read failed (no mark price
+        available to size against).
     4 — g6_smoke only: API down / unreachable (every signed read returned
         None — could be auth failure, IP-allowlist miss, network outage).
 """
@@ -691,6 +710,162 @@ async def _g6_smoke_main(args: argparse.Namespace) -> int:
     return 0
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# g6_dry_run_order — G6.4 order-placement dry-run smoke
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Constructs the canonical $5 SOLUSDT BUY MARKET order described in the
+# README's "G6.4 — Order placement" section. NEVER broadcasts — calls
+# `place_market_order(dry_run=True)` regardless of any flag. Even with
+# `settings.live_binance_enabled=True` this CLI cannot broadcast (the
+# `dry_run=True` argument is hard-coded).
+#
+# The smoke is the operator's last sanity check before wiring G6.4 into
+# the funding-arb runtime (G7.1): does the full path — exchangeInfo
+# round-trip + funding mark-price read + lot_step rounding + min_notional
+# check + client_order_id generation — produce a clean signed-params dict?
+#
+# Sequence:
+#   1. Fetch exchange_info for SOLUSDT (cached).
+#   2. Fetch SOL mark price via `binance_funding.fetch_all_cex_fundings`'s
+#      cousin — actually the audit recommends the markPrice from
+#      `/fapi/v1/premiumIndex` directly. We reuse `fetch_all_cex_fundings`
+#      which already hits the batched endpoint, but we extend it by also
+#      reading a single-symbol mark price. For G6.4 we do a minimal
+#      single-symbol read via httpx (kept here to avoid polluting the
+#      funding module with executor-specific helpers).
+#   3. Call `place_market_order("SOLUSDT", "BUY", 5.0, mark_price=...,
+#      dry_run=True)`.
+#   4. Print OrderResult.dry_run_request verbatim.
+#   5. Exit code per the OrderResult shape.
+#
+# Hard constraint: this CLI ALWAYS passes `dry_run=True`. No `--force-live`
+# flag exists, on purpose. The operator who wants to live-broadcast must
+# wire G6.4 into a runtime that explicitly opts in (G7.1).
+
+
+async def _fetch_solusdt_mark_price() -> float | None:
+    """Fetch SOL mark price from Binance public /fapi/v1/premiumIndex.
+
+    Returns the float on success, None on any failure. Kept inline in the
+    CLI rather than added to `binance_funding.py` because it's an
+    executor-time helper, not part of the funding-arb signal pipeline.
+    """
+    # Imported here to avoid pulling httpx into the watchdog import path.
+    import httpx as _httpx  # local alias keeps the global import surface clean
+
+    from gmx_strategies.settings import settings as _settings
+
+    url = f"{_settings.binance_fapi_base_url}/fapi/v1/premiumIndex"
+    timeout = _httpx.Timeout(_settings.binance_funding_timeout_s)
+    try:
+        async with _httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(url, params={"symbol": "SOLUSDT"})
+    except (_httpx.HTTPError, _httpx.TimeoutException) as exc:
+        log.warning("g6_dry_run_order.mark_price.http_error err=%s", exc)
+        return None
+    if resp.status_code != 200:
+        log.warning("g6_dry_run_order.mark_price.bad_status status=%d", resp.status_code)
+        return None
+    try:
+        body = resp.json()
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    raw = body.get("markPrice")
+    if not isinstance(raw, (str, int, float)):
+        return None
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return value
+
+
+async def _g6_dry_run_order_main(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Run the G6.4 order-placement dry-run smoke. NEVER broadcasts."""
+    from gmx_strategies import binance_exchange_info, binance_order
+
+    print("G6.4 Binance Futures order placement — DRY-RUN smoke")
+    print(f"  base_url: {settings.binance_fapi_base_url}")
+    print(
+        f"  live_binance_enabled: {settings.live_binance_enabled} "
+        "(gate — must be True to broadcast, but this CLI is dry_run-only)",
+    )
+    print()
+
+    # Step 1 — fetch exchange_info (verifies the cache layer is reachable)
+    info_map = await binance_exchange_info.get_cached_exchange_info()
+    if not info_map:
+        print(
+            "ERROR: get_cached_exchange_info returned empty — Binance "
+            "public endpoint down or wrong base_url.",
+        )
+        return 3
+    if "SOLUSDT" not in info_map:
+        print("ERROR: SOLUSDT missing from exchange_info — Binance unexpectedly delisted SOL?")
+        return 3
+    sol_info = info_map["SOLUSDT"]
+    print(
+        f"exchange_info OK: SOLUSDT lot_step={sol_info.lot_step} "
+        f"lot_min={sol_info.lot_min} min_notional=${sol_info.min_notional}",
+    )
+
+    # Step 2 — fetch SOL mark price (public, no auth)
+    mark_price = await _fetch_solusdt_mark_price()
+    if mark_price is None:
+        print("ERROR: could not read SOLUSDT mark price from /fapi/v1/premiumIndex.")
+        return 3
+    print(f"mark_price OK: SOLUSDT markPrice=${mark_price:.4f}")
+
+    # Step 3 — DRY-RUN place_market_order. ALWAYS dry_run=True.
+    #
+    # Notional sized to $6 (not $5) to clear the $5 min_notional with
+    # lot-step rounding headroom across the realistic SOL price range
+    # ($50-$300). At $5 exactly, lot-step rounding (0.01 SOL) shaves the
+    # notional below the $5 min when SOL trades > ~$50. The spec's
+    # "approximately $5" intent is preserved; the +$1 headroom is the
+    # difference between "demonstrate construction" and "demonstrate the
+    # min_notional guard" — we want the first.
+    print()
+    print(
+        "Calling place_market_order('SOLUSDT', 'BUY', notional_usd=$6, "
+        "dry_run=True) ...",
+    )
+    result = await binance_order.place_market_order(
+        "SOLUSDT", "BUY", 6.0,
+        mark_price=mark_price,
+        dry_run=True,
+    )
+
+    # Step 4 — print the OrderResult outcome
+    print()
+    print("OrderResult:")
+    print(f"  submitted={result.submitted}")
+    print(f"  client_order_id={result.client_order_id}")
+    print(f"  error_code={result.error_code}")
+    print(f"  error_msg={result.error_msg}")
+    print(f"  gate_blocked={result.gate_blocked}")
+    print()
+    print("dry_run_request (the params that WOULD have been signed and POSTed):")
+    if result.dry_run_request is None:
+        print("  <None — pre-flight rejection; see error_msg above>")
+    else:
+        for k, v in sorted(result.dry_run_request.items()):
+            print(f"  {k}: {v!r}")
+
+    # Step 5 — exit code
+    if result.dry_run_request is None or result.error_code is not None:
+        # Pre-flight rejection — most likely below_min_notional ($5 SOL
+        # passes SOL's $5 min, so this only fires if the operator's basket
+        # caps or Binance's filters shifted).
+        return 2
+    return 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="gmx_strategies.cli",
@@ -749,6 +924,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "the Binance UI and want to verify they propagate."
         ),
     )
+
+    sub.add_parser(
+        "g6_dry_run_order",
+        help=(
+            "G6.4 order-placement dry-run: constructs a $5 SOLUSDT BUY MARKET "
+            "order at the current mark price and runs place_market_order with "
+            "dry_run=True. NEVER broadcasts. Prints the would-be signed params."
+        ),
+    )
     return p
 
 
@@ -768,6 +952,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_g5_position_smoke_main(args))
     if args.subcommand == "g6_smoke":
         return asyncio.run(_g6_smoke_main(args))
+    if args.subcommand == "g6_dry_run_order":
+        return asyncio.run(_g6_dry_run_order_main(args))
     parser.print_help()
     return 1
 
