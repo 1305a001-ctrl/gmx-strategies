@@ -1,13 +1,15 @@
 """Small argparse CLI for the gmx-strategies package.
 
 Subcommands:
-  - `watchdog`      — trap-surface drift checks (cron-driven). See block below.
-  - `g5_sign_smoke` — G5.2 signer smoke (paper-safe; never broadcasts).
-  - `g6_smoke`      — G6.3 Binance Futures testnet/mainnet shakedown.
-                      Operator-invoked one-shot validation of the entire G6
-                      read-side stack (auth, exchangeInfo, funding, position
-                      mode, account balance, position info) against the
-                      configured base URL (typically demo-fapi.binance.com).
+  - `watchdog`          — trap-surface drift checks (cron-driven). See block below.
+  - `g5_sign_smoke`     — G5.2 signer smoke (paper-safe; never broadcasts).
+  - `g5_position_smoke` — G5.3 position-reader smoke (paper-safe; read-only).
+  - `g6_smoke`          — G6.3 Binance Futures testnet/mainnet shakedown.
+                          Operator-invoked one-shot validation of the entire
+                          G6 read-side stack (auth, exchangeInfo, funding,
+                          position mode, account balance, position info)
+                          against the configured base URL (typically
+                          demo-fapi.binance.com).
 
 `watchdog`:
   Cron on ai-primary (every ~30 minutes). Runs every check in `watchdog.py`,
@@ -30,23 +32,34 @@ Subcommands:
   synthetic $10 SOL MarketIncrease, and dry-run-simulate it via
   `eth_call`. Never broadcasts (`dry_run=True` is hard-coded).
 
+`g5_position_smoke`:
+  Operator-invoked one-shot validation that the G5.3 position reader can
+  reach the GMX V2 Reader on Arbitrum and decode `Position.Props[]`. Reads
+  positions for the canonical empty address `0x0000…0001` (expects an
+  empty list); if a configured executor key is present, also reads + prints
+  the operator's own positions. NEVER broadcasts; read-only `eth_call` only.
+
 Manual invocation:
     python -m gmx_strategies.cli watchdog
     python -m gmx_strategies.cli watchdog --emit-alerts
     python -m gmx_strategies.cli watchdog --json
     python -m gmx_strategies.cli g5_sign_smoke
+    python -m gmx_strategies.cli g5_position_smoke
     python -m gmx_strategies.cli g6_smoke
     python -m gmx_strategies.cli g6_smoke --force-refresh-exchange-info
 
 Exit codes:
-    0 — all checks OK or WARN only / signer smoke acceptable
+    0 — all checks OK or WARN only / signer smoke acceptable /
+        position smoke OK
     1 — CLI usage / argument error (argparse default)
     2 — watchdog: at least one CRITICAL drift found;
         g5_sign_smoke: critical-fail revert;
+        g5_position_smoke: decoder failed (unexpected non-empty / malformed);
         g6_smoke: at least one functional check failed (hedge mode, missing
         market filter, etc.)
     3 — watchdog: at least one ERROR (watchdog itself couldn't reach a source);
         g5_sign_smoke: could not load the executor key;
+        g5_position_smoke: RPC unreachable;
         g6_smoke: credentials not configured (BINANCE_API_KEY/SECRET unset).
     4 — g6_smoke only: API down / unreachable (every signed read returned
         None — could be auth failure, IP-allowlist miss, network outage).
@@ -238,6 +251,137 @@ async def _g5_sign_smoke_main(args: argparse.Namespace) -> int:
         f"acceptable_buckets={sorted(KNOWN_ACCEPTABLE_BUCKETS)}",
     )
     return 2
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# g5_position_smoke — operator-invoked G5.3 position-reader smoke
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Paper-safe — read-only `eth_call` against GMX V2 Reader on Arbitrum.
+# NEVER broadcasts.
+#
+# Sequence:
+#   1. Read positions for the canonical empty address `0x000…0001`.
+#      Should return an empty list. If decode fails or the read raises,
+#      something is structurally wrong with the ABI shape or RPC.
+#   2. If an executor key is configured (via `gmx_signer.get_executor_address`),
+#      also read + print positions for that address. Either an empty list
+#      or any number of real positions is acceptable — the smoke validates
+#      the READER, not the trader's portfolio.
+#
+# Exit codes:
+#   0 — both reads succeeded (regardless of position count)
+#   2 — decoder failed on a non-empty / malformed response
+#   3 — RPC unreachable (transport-layer failure on the canonical empty read)
+
+
+_CANONICAL_EMPTY_ADDRESS = "0x0000000000000000000000000000000000000001"
+
+
+async def _g5_position_smoke_main(args: argparse.Namespace) -> int:
+    """Run the G5.3 position-reader smoke. Returns the appropriate exit code."""
+    import httpx
+
+    from gmx_strategies import gmx_position_reader
+
+    print(
+        f"G5.3 position-reader smoke — read-only on-chain query\n"
+        f"  rpc_url: {settings.arbitrum_rpc_url}\n"
+        f"  reader:  {settings.gmx_reader_address_arbitrum}",
+    )
+    print()
+
+    # Step 1 — canonical empty address. We use a single shared client so
+    # the smoke can distinguish "no positions" (empty list AND no error)
+    # from "RPC unreachable" (empty list AND transport error). The reader's
+    # public surface intentionally returns an empty list on both; the smoke
+    # is the place where the operator wants to see the distinction.
+    timeout = httpx.Timeout(settings.gmx_reader_timeout_s)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Quick connectivity probe — pass through eth_chainId for a cheap
+        # signal that the RPC itself is reachable. If this fails we exit 3
+        # rather than 2, because the user's first action is different
+        # (debug network) than for a decode failure.
+        try:
+            probe = await client.post(
+                settings.arbitrum_rpc_url,
+                json={"jsonrpc": "2.0", "id": 0, "method": "eth_chainId", "params": []},
+            )
+            if probe.status_code != 200:
+                print(
+                    f"RPC unreachable: eth_chainId returned HTTP {probe.status_code}",
+                )
+                return 3
+            probe_body = probe.json()
+            if not isinstance(probe_body, dict) or "result" not in probe_body:
+                print(f"RPC unreachable: malformed response {probe_body!r}")
+                return 3
+            chain_id_hex = probe_body.get("result")
+            if not isinstance(chain_id_hex, str):
+                print(f"RPC unreachable: bad chainId={chain_id_hex!r}")
+                return 3
+            chain_id = int(chain_id_hex, 16)
+            print(f"connectivity: eth_chainId={chain_id}")
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
+            print(f"RPC unreachable: {exc.__class__.__name__}: {exc}")
+            return 3
+
+        # Step 1: read for canonical empty address
+        positions_empty = await gmx_position_reader.fetch_account_positions(
+            _CANONICAL_EMPTY_ADDRESS,
+            client=client,
+        )
+        if positions_empty:
+            # Unexpected — the canonical empty address shouldn't have any
+            # positions. Either GMX state changed or the decoder is wrong.
+            print(
+                f"FAIL: canonical empty address has "
+                f"{len(positions_empty)} positions (expected 0); decoder may "
+                f"be misinterpreting bytes",
+            )
+            for p in positions_empty:
+                print(f"  unexpected: market={p.market_alias} {p}")
+            return 2
+        print(
+            f"empty_address={_CANONICAL_EMPTY_ADDRESS}: 0 positions "
+            f"(expected; decode OK)",
+        )
+
+        # Step 2: if a key is loaded, read the executor's positions too. We
+        # do NOT require it — most dev shells run the smoke without a key.
+        # When present, this exercises the same code path against a real
+        # account (which may or may not have positions; either is fine).
+        from gmx_strategies import gmx_signer
+
+        executor_address = gmx_signer.get_executor_address()
+        if executor_address is None:
+            print(
+                "executor_address=<none>: skipping operator-account read "
+                "(no key configured)",
+            )
+        else:
+            print(f"executor_address={executor_address}: reading positions")
+            executor_positions = await gmx_position_reader.fetch_account_positions(
+                executor_address,
+                client=client,
+            )
+            print(
+                f"executor positions: {len(executor_positions)}",
+            )
+            for p in executor_positions:
+                print(
+                    f"  market={p.market_alias or '<unknown>'} "
+                    f"is_long={p.is_long} "
+                    f"size=${p.size_in_usd_float:.2f} "
+                    f"collateral_token={p.collateral_token}",
+                )
+
+    print()
+    print("exit_code: 0 (position reader smoke OK)")
+    return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # g6_smoke — G6.3 Binance Futures testnet/mainnet shakedown CLI
 # ──────────────────────────────────────────────────────────────────────────
 #
@@ -580,6 +724,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    sub.add_parser(
+        "g5_position_smoke",
+        help=(
+            "G5.3 position-reader smoke: read on-chain positions for the "
+            "canonical empty address (and the executor address if a key is "
+            "configured). Read-only eth_call against GMX V2 Reader."
+        ),
+    )
+
     smoke = sub.add_parser(
         "g6_smoke",
         help=(
@@ -611,6 +764,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_watchdog_main(args))
     if args.subcommand == "g5_sign_smoke":
         return asyncio.run(_g5_sign_smoke_main(args))
+    if args.subcommand == "g5_position_smoke":
+        return asyncio.run(_g5_position_smoke_main(args))
     if args.subcommand == "g6_smoke":
         return asyncio.run(_g6_smoke_main(args))
     parser.print_help()
