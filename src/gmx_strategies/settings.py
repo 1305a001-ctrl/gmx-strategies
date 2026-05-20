@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     # artifact the operator should know about (5min default = enough to spot
     # in logs before the new rate prints).
     binance_settlement_guard_s: int = 300
+    # TTL for the binance_exchange_info module-level cache (seconds). Filter
+    # values (LOT_SIZE, MIN_NOTIONAL, PRICE_FILTER) are dynamic but rarely
+    # change in practice — Binance has been known to bump minQty / notional
+    # during volatile episodes. 1h refresh is paranoid-cheap (one weight-1
+    # request) and ensures a stale cache never silently causes -1111 PRECISION
+    # or -4164 MIN_NOTIONAL rejects. See `binance_exchange_info.py` (G6.1).
+    binance_exchange_info_ttl_s: int = 3600
 
     # Markets to monitor (must match chainlink-streams aliases for the
     # underlying asset — GMX uses Chainlink Data Streams as oracle).
